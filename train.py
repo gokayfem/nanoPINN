@@ -4,12 +4,15 @@ nanoPINN training script — nanoGPT style.
 Single-file, config via globals, override from CLI:
     python train.py --problem=poisson_2d --adam_epochs=10000
     python train.py --activation=siren --n_interior=8000
+    python train.py --fourier_features=64 --fourier_sigma=10.0
+    python train.py --norm=spectral --causal=True
+    python train.py --use_dd=True --dd_subdomains=3,3
 """
 
 import sys
 import torch
 
-from nanopinn import MLP, train
+from nanopinn import MLP, DDModel, decompose_domain, save_checkpoint, load_checkpoint, train, sobol
 from problems import PROBLEMS
 
 # ─── config (override any of these from command line) ────────────────────────
@@ -23,6 +26,18 @@ hidden_dim = 64
 num_hidden = 3
 omega_0 = 30.0  # SIREN frequency (only used if activation='siren')
 
+# fourier features
+fourier_features = 0  # 0 to disable, e.g. 64 for RFF encoding
+fourier_sigma = 1.0
+
+# normalization
+norm = "none"  # 'none' | 'weight' | 'spectral'
+
+# domain decomposition
+use_dd = False
+dd_subdomains = ""  # comma-separated, e.g. "3" for 1D or "2,2" for 2D
+dd_overlap = 0.25
+
 # sampling
 n_interior = 5000
 resample_every = 500
@@ -34,6 +49,15 @@ lbfgs_max_iter = 5000
 do_compile = False
 seed = 42
 log_every = 100
+
+# causal training
+causal = False
+causal_epsilon = 1.0
+causal_n_bins = 20
+
+# checkpoints
+load_from = ""  # path to checkpoint to load
+save_to = ""  # path to save (default: {problem}.pt)
 
 # system
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -69,15 +93,41 @@ print(f"Problem: {prob['name']}")
 print(f"Domain: {prob['domain']}")
 print(f"Device: {device}")
 
-# build model: [input_dim, hidden, ..., hidden, output_dim]
+# build model
 input_dim = len(prob["domain"])
 output_dim = prob["layers"][-1]
 layers = [input_dim] + [hidden_dim] * num_hidden + [output_dim]
-model = MLP(layers, activation=activation, omega_0=omega_0).to(device)
+
+if use_dd:
+    nsub = [int(x) for x in dd_subdomains.split(",") if x] if dd_subdomains else [2] * input_dim
+    subdomains = decompose_domain(prob["domain"], nsub, dd_overlap)
+    model = DDModel(
+        layers, subdomains, activation=activation,
+        fourier_features=fourier_features, fourier_sigma=fourier_sigma, norm=norm,
+    ).to(device)
+    print(f"DDModel: {len(subdomains)} subdomains, {nsub}")
+else:
+    model = MLP(
+        layers, activation=activation, omega_0=omega_0,
+        fourier_features=fourier_features, fourier_sigma=fourier_sigma, norm=norm,
+    ).to(device)
+
 n_params = sum(p.numel() for p in model.parameters())
 print(f"Model: {layers}, {activation}, {n_params:,} params")
+if fourier_features > 0:
+    print(f"Fourier: {fourier_features} features, sigma={fourier_sigma}")
+if norm != "none":
+    print(f"Norm: {norm}")
+
+# optionally load checkpoint
+if load_from:
+    ckpt = load_checkpoint(load_from, model, device)
+    print(f"Loaded checkpoint from {load_from}")
 
 # ─── train ───────────────────────────────────────────────────────────────────
+
+# auto-detect causal time_dim from problem
+causal_time_dim = prob.get("time_dim", -1)
 
 model.train()
 losses = train(
@@ -94,13 +144,15 @@ losses = train(
     log_every=log_every,
     device=device,
     seed=seed,
+    causal=causal,
+    causal_epsilon=causal_epsilon,
+    causal_time_dim=causal_time_dim,
+    causal_n_bins=causal_n_bins,
 )
 
 # ─── evaluate ────────────────────────────────────────────────────────────────
 
 model.eval()
-from nanopinn import sobol
-
 x_test = sobol(1000, prob["domain"], device=device)
 with torch.no_grad():
     u_pred = model(x_test)
@@ -115,5 +167,6 @@ print(f"\nL2 relative error: {l2_rel.item():.4e}")
 
 # ─── save ────────────────────────────────────────────────────────────────────
 
-torch.save({"model": model.state_dict(), "losses": losses, "config": {k: globals()[k] for k in config_keys}}, f"{problem}.pt")
-print(f"Saved {problem}.pt")
+save_path = save_to if save_to else f"{problem}.pt"
+save_checkpoint(save_path, model, losses, {k: globals()[k] for k in config_keys})
+print(f"Saved {save_path}")

@@ -9,6 +9,9 @@ Each problem is a function that returns a dict:
     layers: suggested network architecture
     name:   human-readable name
 
+Multi-output systems (e.g. stokes_2d) have pde_fn returning a vector (R,)
+instead of a scalar, and layers[-1] > 1.
+
 Usage:
     from problems import poisson_1d
     prob = poisson_1d()
@@ -124,7 +127,8 @@ def heat_1d():
     def exact(x):
         return torch.exp(-(math.pi ** 2) * x[:, 1:2]) * torch.sin(math.pi * x[:, 0:1])
 
-    return dict(pde=pde, bc=bc, domain=domain, exact=exact, layers=layers, name="heat_1d")
+    return dict(pde=pde, bc=bc, domain=domain, exact=exact, layers=layers,
+                name="heat_1d", time_dim=1)
 
 
 # ─── 4. Harmonic Oscillator ─────────────────────────────────────────────────
@@ -230,7 +234,91 @@ def advection_1d():
     def exact(x):
         return torch.sin(x[:, 0:1] - x[:, 1:2])
 
-    return dict(pde=pde, bc=bc, domain=domain, exact=exact, layers=layers, name="advection_1d")
+    return dict(pde=pde, bc=bc, domain=domain, exact=exact, layers=layers,
+                name="advection_1d", time_dim=1)
+
+
+# ─── 7. Stokes 2D (multi-output system) ─────────────────────────────────────
+# Stokes equations on (0, 1)^2 with mu=1:
+#   -dp/dx + mu*(u_xx + u_yy) = f_x
+#   -dp/dy + mu*(v_xx + v_yy) = f_y
+#   u_x + v_y = 0  (continuity)
+#
+# Manufactured solution (divergence-free):
+#   u(x,y) =  sin(pi*x)*cos(pi*y)
+#   v(x,y) = -cos(pi*x)*sin(pi*y)
+#   p(x,y) =  sin(pi*x)*sin(pi*y)
+#
+# Network output: (u, v, p) -> 3 components
+# PDE residual: 3 equations -> returns (3,) vector
+
+def stokes_2d(mu: float = 1.0):
+    domain = [(0.0, 1.0), (0.0, 1.0)]
+    layers = [2, 64, 64, 64, 3]
+
+    # precompute forcing terms from the manufactured solution
+    # u = sin(pi*x)*cos(pi*y)   => u_xx + u_yy = -2*pi^2 * sin(pi*x)*cos(pi*y)
+    # v = -cos(pi*x)*sin(pi*y)  => v_xx + v_yy = 2*pi^2 * cos(pi*x)*sin(pi*y)
+    # p = sin(pi*x)*sin(pi*y)   => dp/dx = pi*cos(pi*x)*sin(pi*y)
+    #                               dp/dy = pi*sin(pi*x)*cos(pi*y)
+    # f_x = -dp/dx + mu*(u_xx + u_yy) = -pi*cos(pi*x)*sin(pi*y) - 2*mu*pi^2*sin(pi*x)*cos(pi*y)
+    # f_y = -dp/dy + mu*(v_xx + v_yy) = -pi*sin(pi*x)*cos(pi*y) + 2*mu*pi^2*cos(pi*x)*sin(pi*y)
+
+    def pde(net, x):
+        # net(x) returns (3,): [u, v, p]
+        J = jacobian(net, x)   # (3, 2): d[u,v,p]/d[x,y]
+        H = hessian(net, x)    # (3, 2, 2): d²[u,v,p]/d[x,y]d[x,y]
+
+        u_xx, u_yy = H[0, 0, 0], H[0, 1, 1]
+        v_xx, v_yy = H[1, 0, 0], H[1, 1, 1]
+        dp_dx, dp_dy = J[2, 0], J[2, 1]
+        u_x, v_y = J[0, 0], J[1, 1]
+
+        pi_t = torch.tensor(math.pi)
+        sx, cx = torch.sin(pi_t * x[0]), torch.cos(pi_t * x[0])
+        sy, cy = torch.sin(pi_t * x[1]), torch.cos(pi_t * x[1])
+
+        f_x = -math.pi * cx * sy - 2.0 * mu * (math.pi ** 2) * sx * cy
+        f_y = -math.pi * sx * cy + 2.0 * mu * (math.pi ** 2) * cx * sy
+
+        r_mom_x = -dp_dx + mu * (u_xx + u_yy) - f_x
+        r_mom_y = -dp_dy + mu * (v_xx + v_yy) - f_y
+        r_cont = u_x + v_y
+
+        return torch.stack([r_mom_x, r_mom_y, r_cont])
+
+    def bc(model, device):
+        n = 100
+        pts = []
+        for dim in [0, 1]:
+            for val in [0.0, 1.0]:
+                p = sobol(n, domain, device=device)
+                p = p.clone()
+                p[:, dim] = val
+                pts.append(p)
+        all_pts = torch.cat(pts, dim=0)
+        pred = model(all_pts)  # (N, 3)
+
+        # exact values on boundary
+        pi_t = torch.tensor(math.pi)
+        x_coord = all_pts[:, 0:1]
+        y_coord = all_pts[:, 1:2]
+        u_ex = torch.sin(pi_t * x_coord) * torch.cos(pi_t * y_coord)
+        v_ex = -torch.cos(pi_t * x_coord) * torch.sin(pi_t * y_coord)
+        p_ex = torch.sin(pi_t * x_coord) * torch.sin(pi_t * y_coord)
+        target = torch.cat([u_ex, v_ex, p_ex], dim=1)
+
+        return ((pred - target) ** 2).mean()
+
+    def exact(x):
+        pi_t = torch.tensor(math.pi)
+        u = torch.sin(pi_t * x[:, 0:1]) * torch.cos(pi_t * x[:, 1:2])
+        v = -torch.cos(pi_t * x[:, 0:1]) * torch.sin(pi_t * x[:, 1:2])
+        p = torch.sin(pi_t * x[:, 0:1]) * torch.sin(pi_t * x[:, 1:2])
+        return torch.cat([u, v, p], dim=1)
+
+    return dict(pde=pde, bc=bc, domain=domain, exact=exact, layers=layers,
+                name="stokes_2d", n_outputs=3)
 
 
 # ─── Registry ────────────────────────────────────────────────────────────────
@@ -242,4 +330,5 @@ PROBLEMS = {
     "harmonic_oscillator": harmonic_oscillator,
     "helmholtz_1d": helmholtz_1d,
     "advection_1d": advection_1d,
+    "stokes_2d": stokes_2d,
 }

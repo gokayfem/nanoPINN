@@ -1,6 +1,6 @@
 # nanoPINN
 
-The simplest, fastest repository for training Physics-Informed Neural Networks. It is a rewrite of the PINN paradigm that prioritizes teeth over education, inspired by [nanoGPT](https://github.com/karpathy/nanoGPT). The file `nanopinn.py` is a ~300-line library that gives you `jacobian`, `hessian`, `MLP`, Sobol sampling, and a hybrid Adam→L-BFGS training loop. The file `train.py` is a ~100-line nanoGPT-style training script with config-as-globals. That's it.
+The simplest, fastest repository for training Physics-Informed Neural Networks. It is a rewrite of the PINN paradigm that prioritizes teeth over education, inspired by [nanoGPT](https://github.com/karpathy/nanoGPT). The file `nanopinn.py` is a ~550-line library that gives you `jacobian`, `hessian`, `MLP`, Fourier features, domain decomposition, causal training, and a hybrid Adam→L-BFGS training loop. The file `train.py` is a ~140-line nanoGPT-style training script with config-as-globals. That's it.
 
 Because the code is so simple, it is very easy to hack to your needs: define any PDE as a plain Python function, pick an activation, and train.
 
@@ -57,6 +57,31 @@ python train.py --problem=heat_1d
 python train.py --problem=helmholtz_1d
 python train.py --problem=harmonic_oscillator
 python train.py --problem=advection_1d
+python train.py --problem=stokes_2d          # multi-output system (u, v, p)
+```
+
+**I want Fourier features for high-frequency solutions.**
+
+```
+python train.py --fourier_features=64 --fourier_sigma=10.0
+```
+
+**I want spectral normalization for stable training.**
+
+```
+python train.py --norm=spectral
+```
+
+**I want causal training for time-dependent PDEs.**
+
+```
+python train.py --problem=heat_1d --causal=True
+```
+
+**I want domain decomposition (FBPINNs-style).**
+
+```
+python train.py --problem=poisson_2d --use_dd=True --dd_subdomains=3,3
 ```
 
 **I want to use SIREN.** Switch the activation:
@@ -100,19 +125,68 @@ losses = train(model, pde_fn=pde, bc_fn=bc, domain=[(0.0, 1.0)])
 
 The key insight: `pde(net, x)` receives a callable `net` mapping a single point `(d,)` → `(m,)`, and a single point `x` of shape `(d,)`. You use `jacobian(net, x)` and `hessian(net, x)` to get derivatives. The library automatically `vmap`s this over all collocation points for batched, efficient computation.
 
-For time-dependent PDEs, time is just another input dimension:
+**Multi-output systems** (Navier-Stokes, elasticity): return a vector instead of a scalar:
 
 ```python
-# Heat equation: u_t = u_xx
-def heat_pde(net, x):
-    J = jacobian(net, x)   # (1, 2) — [du/dx, du/dt]
-    H = hessian(net, x)    # (1, 2, 2)
-    u_t = J[0, 1]          # du/dt
-    u_xx = H[0, 0, 0]      # d²u/dx²
-    return u_t - u_xx
+# Stokes: network outputs (u, v, p), PDE returns (3,) residual
+def stokes_pde(net, x):
+    J = jacobian(net, x)   # (3, 2): d[u,v,p]/d[x,y]
+    H = hessian(net, x)    # (3, 2, 2)
+    r_mom_x = -J[2, 0] + (H[0, 0, 0] + H[0, 1, 1]) - f_x(x)
+    r_mom_y = -J[2, 1] + (H[1, 0, 0] + H[1, 1, 1]) - f_y(x)
+    r_cont  = J[0, 0] + J[1, 1]
+    return torch.stack([r_mom_x, r_mom_y, r_cont])
 
-model = MLP([2, 64, 64, 64, 1])
-train(model, heat_pde, my_bc, domain=[(0, 1), (0, 1)])  # x in [0,1], t in [0,1]
+model = MLP([2, 64, 64, 64, 3])  # 3 outputs: u, v, p
+```
+
+## features
+
+### Fourier feature encoding
+
+Random Fourier Features (RFF) help networks learn high-frequency solutions by mapping inputs through `[sin(2πxB), cos(2πxB)]` with a random frequency matrix B:
+
+```python
+model = MLP([2, 64, 1], fourier_features=64, fourier_sigma=10.0)
+```
+
+### Weight / spectral normalization
+
+Stabilize training and improve convergence:
+
+```python
+model = MLP([2, 64, 1], norm="spectral")  # or norm="weight"
+```
+
+### Causal training
+
+For time-dependent PDEs, weight residuals so earlier times are prioritized (Wang et al. 2022):
+
+```python
+train(model, pde, bc, domain, causal=True, causal_epsilon=1.0)
+```
+
+### Domain decomposition
+
+FBPINNs-style: split domain into overlapping subdomains with separate sub-networks blended by cosine windows:
+
+```python
+from nanopinn import DDModel, decompose_domain
+
+subs = decompose_domain([(0, 1), (0, 1)], n_subdomains=[3, 3], overlap=0.25)
+model = DDModel([2, 64, 1], subs)
+train(model, pde, bc, domain)
+```
+
+### Checkpoints
+
+Save and load trained models:
+
+```python
+from nanopinn import save_checkpoint, load_checkpoint
+
+save_checkpoint("model.pt", model, losses, config)
+ckpt = load_checkpoint("model.pt", model)  # loads weights into model
 ```
 
 ## how it works
@@ -130,16 +204,47 @@ The training loop also supports:
 
 ## built-in problems
 
-Six PDEs with exact analytical solutions, verified by the test suite:
+Seven PDEs with exact analytical solutions, verified by the test suite:
 
-| Problem | Equation | Domain | Exact Solution |
-|---------|----------|--------|----------------|
-| `poisson_1d` | −u″ = π²sin(πx) | [0, 1] | sin(πx) |
-| `poisson_2d` | −Δu = 2π²sin(πx)sin(πy) | [0,1]² | sin(πx)sin(πy) |
-| `heat_1d` | u_t = u_xx | [0,1]×[0,1] | e^(−π²t)sin(πx) |
-| `harmonic_oscillator` | u″ + u = 0 | [0, 2π] | cos(x) |
-| `helmholtz_1d` | −u″ − k²u = f | [0, 1] | sin(πx) |
-| `advection_1d` | u_t + u_x = 0 | [0,2π]×[0,1] | sin(x − t) |
+| Problem | Equation | Domain | Exact Solution | Outputs |
+|---------|----------|--------|----------------|---------|
+| `poisson_1d` | −u″ = π²sin(πx) | [0, 1] | sin(πx) | 1 |
+| `poisson_2d` | −Δu = 2π²sin(πx)sin(πy) | [0,1]² | sin(πx)sin(πy) | 1 |
+| `heat_1d` | u_t = u_xx | [0,1]×[0,1] | e^(−π²t)sin(πx) | 1 |
+| `harmonic_oscillator` | u″ + u = 0 | [0, 2π] | cos(x) | 1 |
+| `helmholtz_1d` | −u″ − k²u = f | [0, 1] | sin(πx) | 1 |
+| `advection_1d` | u_t + u_x = 0 | [0,2π]×[0,1] | sin(x − t) | 1 |
+| `stokes_2d` | Stokes flow | [0,1]² | manufactured | 3 (u,v,p) |
+
+## benchmarks
+
+Run the full benchmark suite comparing all features across all problems:
+
+```
+python benchmark.py
+python benchmark.py --problems=poisson_1d,heat_1d --configs=baseline,fourier
+python benchmark.py --adam_epochs=1000  # fast mode
+```
+
+Generates a comparison table with L2 error, training time, and peak memory for each problem × config combination. Results saved to `benchmark_results/`.
+
+## pre-trained checkpoints
+
+Generate checkpoints for all built-in problems:
+
+```
+python generate_checkpoints.py
+```
+
+Load a pre-trained model:
+
+```python
+from nanopinn import MLP, load_checkpoint
+
+model = MLP([1, 64, 64, 64, 1])
+ckpt = load_checkpoint("checkpoints/poisson_1d.pt", model)
+# model is now ready for evaluation or fine-tuning
+```
 
 ## API reference
 
@@ -151,35 +256,51 @@ jacobian(f, x)              # f:(d,)→(m,), x:(d,) → (m, d)
 hessian(f, x)               # f:(d,)→(m,), x:(d,) → (m, d, d)
 laplacian(f, x, out_idx=0)  # sum of d²f/dx_i²  → scalar
 
-# ─── Network ───
-MLP(layers, activation='tanh', omega_0=30.0)
-# layers: [input_dim, hidden, ..., hidden, output_dim]
-# activation: 'tanh' | 'siren' | 'gelu' | 'swish'
+# ─── Networks ───
+FourierFeatures(in_features, mapping_size, sigma=1.0)
+MLP(layers, activation='tanh', omega_0=30.0,
+    fourier_features=0, fourier_sigma=1.0, norm='none')
+DDModel(layers, subdomains, activation='tanh', ...)
 
 # ─── Sampling ───
 sobol(n, bounds, device)     # Sobol quasi-random  → (n, d)
 uniform(n, bounds, device)   # uniform random      → (n, d)
 boundary(n, bounds, device)  # points on faces     → (n, d)
 
+# ─── Loss ───
+pde_loss(model, pde_fn, points)     # vmapped PDE residual loss
+causal_pde_loss(model, pde_fn, points, time_dim, epsilon, n_bins)
+causal_weights(points, residuals_sq, time_dim, epsilon, n_bins)
+
+# ─── Domain decomposition ───
+cosine_window(center, half_width)    # window function factory
+decompose_domain(bounds, n_subdomains, overlap)
+
+# ─── Checkpoints ───
+save_checkpoint(path, model, losses, config, metadata=None)
+load_checkpoint(path, model=None, device='cpu')
+
 # ─── Training ───
 train(model, pde_fn, bc_fn, domain,
       n_interior=5000, adam_lr=1e-3, adam_epochs=5000,
       lbfgs_max_iter=5000, do_compile=False,
       resample_every=500, log_every=100,
-      device='cpu', seed=42)
+      device='cpu', seed=42,
+      causal=False, causal_epsilon=1.0,
+      causal_time_dim=-1, causal_n_bins=20)
 # Returns: list[float] (loss history)
 ```
 
 ## tests
 
-39 tests covering derivatives, models, sampling, and convergence against exact solutions:
+93 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, and benchmarks:
 
 ```
 pip install pytest
 python -m pytest tests/ -v
 ```
 
-Fast tests only (~30s):
+Fast tests only (~60s):
 
 ```
 python -m pytest tests/ -v -m "not slow"
@@ -195,21 +316,29 @@ The convergence tests actually train PINNs and verify the L2 relative error agai
 | Helmholtz 1D | < 5% |
 | Harmonic Oscillator | < 15% |
 | Advection 1D | < 15% |
+| Stokes 2D | < 25% |
 | SIREN on Poisson 1D | < 15% |
+| DD on Poisson 1D | < 15% |
 
 ## file structure
 
 ```
 nanopinn/
-├── nanopinn.py     # ~300 lines. the entire library.
-├── problems.py     # ~250 lines. 6 PDEs with exact solutions.
-├── train.py        # ~100 lines. nanoGPT-style training script.
+├── nanopinn.py              # ~550 lines. the entire library.
+├── problems.py              # ~300 lines. 7 PDEs with exact solutions.
+├── train.py                 # ~140 lines. nanoGPT-style training script.
+├── benchmark.py             # ~200 lines. benchmark suite.
+├── generate_checkpoints.py  # ~70 lines. checkpoint generator.
 ├── pytest.ini
 └── tests/
     ├── test_derivatives.py    # jacobian/hessian vs autograd reference
-    ├── test_model.py          # MLP shapes, activations, gradient flow
+    ├── test_model.py          # MLP, Fourier, normalization
     ├── test_sampling.py       # bounds, coverage, shapes
-    └── test_convergence.py    # convergence to exact analytical solutions
+    ├── test_convergence.py    # convergence to exact solutions + multi-output
+    ├── test_causal.py         # causal weighting + training
+    ├── test_dd.py             # domain decomposition + DDModel
+    ├── test_checkpoints.py    # save/load roundtrip
+    └── test_benchmark.py      # benchmark framework
 ```
 
 ## design philosophy
@@ -220,8 +349,10 @@ Stolen from the best:
 |--------|-------------|
 | [nanoGPT](https://github.com/karpathy/nanoGPT) | Single-file library, config-as-globals, no frameworks |
 | [DeepXDE](https://github.com/lululxvi/deepxde) | PDE-as-a-Python-function returning a residual |
-| [FBPINNs](https://github.com/benmoseley/FBPINNs) | `vmap` for batched per-point derivative computation |
+| [FBPINNs](https://github.com/benmoseley/FBPINNs) | `vmap` for batched per-point derivatives, domain decomposition |
 | [PyDEns](https://github.com/analysiscenter/pydens) | Minimal API surface — `D(f, x)` style operators |
+| [Wang et al. 2022](https://arxiv.org/abs/2203.07404) | Causal training for time-dependent PDEs |
+| [Tancik et al. 2020](https://arxiv.org/abs/2006.10739) | Fourier feature encoding for high-frequency solutions |
 
 What we deliberately left out:
 - No YAML/Hydra config files
@@ -232,10 +363,14 @@ What we deliberately left out:
 
 ## todos
 
-- [ ] Fourier feature input encoding
-- [ ] Weight normalization / spectral normalization
-- [ ] Multi-output system support (Navier-Stokes, elasticity)
-- [ ] Domain decomposition (FBPINNs-style)
-- [ ] Causal training for time-dependent PDEs
-- [ ] Benchmark suite with timing comparisons
-- [ ] Pre-trained checkpoints for common problems
+- [x] Fourier feature input encoding
+- [x] Weight normalization / spectral normalization
+- [x] Multi-output system support (Stokes 2D)
+- [x] Domain decomposition (FBPINNs-style)
+- [x] Causal training for time-dependent PDEs
+- [x] Benchmark suite with timing comparisons
+- [x] Pre-trained checkpoints for common problems
+- [ ] Inverse problems
+- [ ] Transfer learning across PDE parameters
+- [ ] Multi-GPU training
+- [ ] Adaptive loss weighting (NTK-based)

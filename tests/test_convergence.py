@@ -24,6 +24,7 @@ from problems import (
     harmonic_oscillator,
     helmholtz_1d,
     advection_1d,
+    stokes_2d,
 )
 
 
@@ -165,3 +166,71 @@ class TestTrainingBasics:
               adam_epochs=10, lbfgs_max_iter=10, n_interior=100, log_every=100)
         w_after = model.net[0].weight.data
         assert not torch.equal(w_before, w_after), "Weights should change during training"
+
+
+# ─── Multi-output system tests ──────────────────────────────────────────────
+
+
+class TestMultiOutputPdeLoss:
+    """Test that pde_loss handles vector residuals correctly."""
+
+    def test_vector_residual_shapes(self):
+        """pde_fn returning (3,) vector should produce scalar loss and (N,) residuals."""
+        from nanopinn import pde_loss
+        model = MLP([2, 32, 3])
+
+        def vector_pde(net, x):
+            u = net(x)
+            return u  # 3-component residual
+
+        pts = torch.rand(30, 2, requires_grad=True)
+        loss, res_sq = pde_loss(model, vector_pde, pts)
+        assert loss.dim() == 0, "Loss should be scalar"
+        assert res_sq.shape == (30,), f"Per-point residuals should be (N,), got {res_sq.shape}"
+
+    def test_scalar_residual_backward_compat(self):
+        """Scalar pde_fn should still work identically."""
+        from nanopinn import pde_loss
+        model = MLP([1, 32, 1])
+
+        def scalar_pde(net, x):
+            u = net(x)
+            return u[0]  # scalar
+
+        pts = torch.rand(20, 1, requires_grad=True)
+        loss, res_sq = pde_loss(model, scalar_pde, pts)
+        assert loss.dim() == 0
+        assert res_sq.shape == (20,)
+
+
+@pytest.mark.slow
+class TestStokes2DConvergence:
+    """Stokes 2D multi-output system convergence test."""
+
+    def test_loss_decreases(self):
+        prob = stokes_2d()
+        model = MLP(prob["layers"])
+        model.train()
+        losses = train(
+            model, pde_fn=prob["pde"], bc_fn=prob["bc"], domain=prob["domain"],
+            adam_epochs=500, lbfgs_max_iter=500, n_interior=500,
+            log_every=500, seed=42,
+        )
+        assert losses[-1] < losses[0], "Stokes 2D loss should decrease"
+
+    def test_convergence(self):
+        prob = stokes_2d()
+        model = MLP(prob["layers"])
+        model.train()
+        losses = train(
+            model, pde_fn=prob["pde"], bc_fn=prob["bc"], domain=prob["domain"],
+            adam_epochs=3000, lbfgs_max_iter=3000, n_interior=3000,
+            log_every=1000, seed=42,
+        )
+        model.eval()
+        x_test = sobol(500, prob["domain"])
+        with torch.no_grad():
+            u_pred = model(x_test)
+            u_exact = prob["exact"](x_test)
+        l2_rel = (torch.norm(u_pred - u_exact) / torch.norm(u_exact)).item()
+        assert l2_rel < 0.25, f"Stokes 2D L2 error {l2_rel:.4f} > 25%"
