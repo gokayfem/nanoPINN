@@ -7,12 +7,18 @@ Single-file, config via globals, override from CLI:
     python train.py --fourier_features=64 --fourier_sigma=10.0
     python train.py --norm=spectral --causal=True
     python train.py --use_dd=True --dd_subdomains=3,3
+    python train.py --problem=helmholtz_1d_inverse  # inverse problem
+    python train.py --ntk_weighting=True            # NTK loss balancing
+    python train.py --transfer_from=helmholtz_1d.pt # transfer learning
 """
 
 import sys
 import torch
 
-from nanopinn import MLP, DDModel, decompose_domain, save_checkpoint, load_checkpoint, train, sobol
+from nanopinn import (
+    MLP, DDModel, decompose_domain, save_checkpoint, load_checkpoint,
+    train, sobol, freeze_layers, unfreeze_all,
+)
 from problems import PROBLEMS
 
 # ─── config (override any of these from command line) ────────────────────────
@@ -54,6 +60,15 @@ log_every = 100
 causal = False
 causal_epsilon = 1.0
 causal_n_bins = 20
+
+# NTK adaptive weighting
+ntk_weighting = False
+ntk_every = 100
+
+# transfer learning
+transfer_from = ""  # path to source checkpoint
+transfer_keep_last = 1  # layers to keep trainable during transfer
+unfreeze_after = 0  # unfreeze all after this many Adam epochs (0=no freeze)
 
 # checkpoints
 load_from = ""  # path to checkpoint to load
@@ -119,15 +134,37 @@ if fourier_features > 0:
 if norm != "none":
     print(f"Norm: {norm}")
 
-# optionally load checkpoint
-if load_from:
+# load checkpoint or transfer
+if transfer_from:
+    ckpt = load_checkpoint(transfer_from, model, device, strict=False)
+    print(f"Transfer from {transfer_from}")
+    if unfreeze_after > 0:
+        freeze_layers(model, keep_last=transfer_keep_last)
+        frozen_count = sum(1 for p in model.parameters() if not p.requires_grad)
+        print(f"Frozen {frozen_count} params, will unfreeze after epoch {unfreeze_after}")
+elif load_from:
     ckpt = load_checkpoint(load_from, model, device)
     print(f"Loaded checkpoint from {load_from}")
+
+# inverse problem params
+extra_params = prob.get("inv_params")
+if extra_params is not None:
+    extra_params = extra_params.to(device)
+    print(f"Inverse params: {extra_params.as_dict()}")
+    print(f"True params: {prob['true_params']}")
 
 # ─── train ───────────────────────────────────────────────────────────────────
 
 # auto-detect causal time_dim from problem
 causal_time_dim = prob.get("time_dim", -1)
+
+# callback for transfer learning unfreezing
+_callback = None
+if unfreeze_after > 0:
+    def _callback(epoch, loss):
+        if epoch == unfreeze_after:
+            unfreeze_all(model)
+            print(f"[epoch {epoch}] Unfroze all layers")
 
 model.train()
 losses = train(
@@ -135,6 +172,7 @@ losses = train(
     pde_fn=prob["pde"],
     bc_fn=prob["bc"],
     domain=prob["domain"],
+    extra_params=extra_params,
     n_interior=n_interior,
     adam_lr=adam_lr,
     adam_epochs=adam_epochs,
@@ -148,6 +186,9 @@ losses = train(
     causal_epsilon=causal_epsilon,
     causal_time_dim=causal_time_dim,
     causal_n_bins=causal_n_bins,
+    ntk_weighting=ntk_weighting,
+    ntk_every=ntk_every,
+    callback=_callback,
 )
 
 # ─── evaluate ────────────────────────────────────────────────────────────────
@@ -158,15 +199,24 @@ with torch.no_grad():
     u_pred = model(x_test)
     u_exact = prob["exact"](x_test).to(device)
 
-# handle shape mismatch (1D problems return flat, model returns (N, 1))
 if u_exact.dim() == 1:
     u_exact = u_exact.unsqueeze(1)
 
 l2_rel = torch.norm(u_pred - u_exact) / torch.norm(u_exact)
 print(f"\nL2 relative error: {l2_rel.item():.4e}")
 
+# report inverse params
+if extra_params is not None:
+    recovered = extra_params.as_dict()
+    true_vals = prob["true_params"]
+    print("Recovered parameters:")
+    for k in recovered:
+        rel_err = abs(recovered[k] - true_vals[k]) / abs(true_vals[k])
+        print(f"  {k}: {recovered[k]:.4f} (true: {true_vals[k]:.4f}, error: {rel_err:.1%})")
+
 # ─── save ────────────────────────────────────────────────────────────────────
 
 save_path = save_to if save_to else f"{problem}.pt"
-save_checkpoint(save_path, model, losses, {k: globals()[k] for k in config_keys})
+pde_params = extra_params.as_dict() if extra_params is not None else None
+save_checkpoint(save_path, model, losses, {k: globals()[k] for k in config_keys}, pde_params=pde_params)
 print(f"Saved {save_path}")

@@ -321,6 +321,111 @@ def stokes_2d(mu: float = 1.0):
                 name="stokes_2d", n_outputs=3)
 
 
+# ─── 8. Helmholtz 1D Inverse ─────────────────────────────────────────────────
+# Inverse problem: recover wavenumber k from noisy observations.
+# PDE: -u''(x) - k^2 * u(x) = f(x), exact: sin(pi*x)
+# The true k is known; we initialize InverseParams with a wrong guess.
+
+def helmholtz_1d_inverse(true_k: float = 2.0, noise_std: float = 0.01, n_obs: int = 200):
+    from nanopinn import InverseParams
+    domain = [(0.0, 1.0)]
+    layers = [1, 64, 64, 64, 1]
+
+    # the unknown parameter — initialized to a wrong value
+    inv = InverseParams(k=1.0)
+
+    # generate noisy observations from exact solution
+    torch.manual_seed(0)
+    x_obs = sobol(n_obs, domain)
+    u_exact_obs = torch.sin(math.pi * x_obs)
+    u_obs = u_exact_obs + noise_std * torch.randn_like(u_exact_obs)
+
+    # true forcing for the exact solution with true_k
+    f_coeff = math.pi ** 2 - true_k ** 2
+
+    def pde(net, x):
+        u = net(x)
+        H = hessian(net, x)
+        f = f_coeff * torch.sin(torch.tensor(math.pi) * x[0])
+        return -H[0, 0, 0] - inv.k ** 2 * u[0] - f
+
+    def bc(model, device):
+        from nanopinn import observation_loss
+        n = 200
+        x0 = torch.zeros(n, 1, device=device)
+        x1 = torch.ones(n, 1, device=device)
+        bc_loss = (model(x0) ** 2).mean() + (model(x1) ** 2).mean()
+        obs_loss = observation_loss(model, x_obs.to(device), u_obs.to(device))
+        return bc_loss + 10.0 * obs_loss
+
+    def exact(x):
+        return torch.sin(math.pi * x)
+
+    return dict(
+        pde=pde, bc=bc, domain=domain, exact=exact, layers=layers,
+        name="helmholtz_1d_inverse",
+        inv_params=inv,
+        true_params={"k": true_k},
+        x_obs=x_obs, u_obs=u_obs,
+    )
+
+
+# ─── 9. Heat 1D Inverse ─────────────────────────────────────────────────────
+# Inverse problem: recover thermal diffusivity alpha from noisy observations.
+# PDE: u_t = alpha * u_xx, exact: exp(-alpha*pi^2*t) * sin(pi*x)
+
+def heat_1d_inverse(true_alpha: float = 1.0, noise_std: float = 0.01, n_obs: int = 300):
+    from nanopinn import InverseParams
+    domain = [(0.0, 1.0), (0.0, 0.5)]
+    layers = [2, 64, 64, 64, 1]
+
+    inv = InverseParams(alpha=0.5)
+
+    torch.manual_seed(0)
+    x_obs = sobol(n_obs, domain)
+    u_exact_obs = torch.exp(-true_alpha * (math.pi ** 2) * x_obs[:, 1:2]) * torch.sin(math.pi * x_obs[:, 0:1])
+    u_obs = u_exact_obs + noise_std * torch.randn_like(u_exact_obs)
+
+    def pde(net, x):
+        J = jacobian(net, x)
+        H = hessian(net, x)
+        u_t = J[0, 1]
+        u_xx = H[0, 0, 0]
+        return u_t - inv.alpha * u_xx
+
+    def bc(model, device):
+        from nanopinn import observation_loss
+        n = 200
+        pi_t = torch.tensor(math.pi)
+
+        # IC: u(x, 0) = sin(pi*x)
+        x_ic = sobol(n, [(0.0, 1.0)], device=device)
+        t_ic = torch.zeros(n, 1, device=device)
+        pts_ic = torch.cat([x_ic, t_ic], dim=1)
+        target_ic = torch.sin(pi_t * x_ic)
+        loss_ic = ((model(pts_ic) - target_ic) ** 2).mean()
+
+        # BC: u(0,t) = u(1,t) = 0
+        t_bc = sobol(n, [(0.0, 0.5)], device=device)
+        pts_0 = torch.cat([torch.zeros(n, 1, device=device), t_bc], dim=1)
+        pts_1 = torch.cat([torch.ones(n, 1, device=device), t_bc], dim=1)
+        loss_bc = (model(pts_0) ** 2).mean() + (model(pts_1) ** 2).mean()
+
+        obs_loss = observation_loss(model, x_obs.to(device), u_obs.to(device))
+        return loss_ic + loss_bc + 10.0 * obs_loss
+
+    def exact(x):
+        return torch.exp(-true_alpha * (math.pi ** 2) * x[:, 1:2]) * torch.sin(math.pi * x[:, 0:1])
+
+    return dict(
+        pde=pde, bc=bc, domain=domain, exact=exact, layers=layers,
+        name="heat_1d_inverse", time_dim=1,
+        inv_params=inv,
+        true_params={"alpha": true_alpha},
+        x_obs=x_obs, u_obs=u_obs,
+    )
+
+
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 PROBLEMS = {
@@ -331,4 +436,6 @@ PROBLEMS = {
     "helmholtz_1d": helmholtz_1d,
     "advection_1d": advection_1d,
     "stokes_2d": stokes_2d,
+    "helmholtz_1d_inverse": helmholtz_1d_inverse,
+    "heat_1d_inverse": heat_1d_inverse,
 }

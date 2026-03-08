@@ -107,6 +107,15 @@ CONFIGS = {
         "causal": False,
         "use_dd": False,
     },
+    "ntk": {
+        "activation": "tanh",
+        "fourier_features": 0,
+        "norm": "none",
+        "causal": False,
+        "use_dd": False,
+        "ntk_weighting": True,
+        "ntk_every": 100,
+    },
 }
 
 
@@ -162,11 +171,19 @@ def run_benchmark(problem_name: str, config_name: str, cfg: dict) -> dict:
             "causal_time_dim": prob.get("time_dim", -1),
         }
 
+    ntk_kwargs = {}
+    if cfg.get("ntk_weighting"):
+        ntk_kwargs = {
+            "ntk_weighting": True,
+            "ntk_every": cfg.get("ntk_every", 100),
+        }
+
     try:
         losses = train(
             model, pde_fn=prob["pde"], bc_fn=prob["bc"], domain=prob["domain"],
             n_interior=n_interior, adam_epochs=adam_epochs, lbfgs_max_iter=lbfgs_max_iter,
-            log_every=log_every, device=device, seed=seed, **causal_kwargs,
+            log_every=log_every, device=device, seed=seed,
+            **causal_kwargs, **ntk_kwargs,
         )
     except Exception as e:
         return {

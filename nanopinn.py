@@ -86,7 +86,9 @@ class SirenLayer(nn.Module):
 
 
 def _apply_norm(module: nn.Module, norm_type: str) -> nn.Module:
-    """Apply weight or spectral normalization to all Linear layers."""
+    """Apply weight or spectral normalization to all Linear layers.
+    Note: mutates in-place (PyTorch convention). Returns module for chaining.
+    """
     if norm_type == "none":
         return module
     if norm_type not in ("weight", "spectral"):
@@ -249,10 +251,28 @@ def pde_loss(
     residuals = _vmapped_residuals(model, pde_fn, points)
     sq = residuals ** 2
     if sq.dim() == 1:
-        # scalar residual: (N,)
         return sq.mean(), sq.detach()
-    # vector residual: (N, R) -> reduce to (N,) for resampling
     return sq.mean(), sq.sum(dim=1).detach()
+
+
+def observation_loss(
+    model: nn.Module,
+    x_obs: torch.Tensor,
+    u_obs: torch.Tensor,
+) -> torch.Tensor:
+    """MSE between model predictions and observations (for inverse problems).
+
+    Args:
+        model: neural network
+        x_obs: observation locations (N_obs, d)
+        u_obs: observed values (N_obs, out) or (N_obs,)
+
+    Returns:
+        scalar MSE loss
+    """
+    pred = model(x_obs)
+    target = u_obs.reshape(pred.shape) if u_obs.shape != pred.shape else u_obs
+    return ((pred - target) ** 2).mean()
 
 
 # ─── Causal training ────────────────────────────────────────────────────────
@@ -285,21 +305,16 @@ def causal_weights(
     if t_max - t_min < 1e-10:
         return torch.ones(points.shape[0], device=points.device)
 
-    # bin edges
     edges = torch.linspace(t_min.item(), t_max.item(), n_bins + 1, device=points.device)
-    bin_idx = torch.bucketize(t, edges[1:-1])  # (N,) in [0, n_bins-1]
+    bin_idx = torch.bucketize(t, edges[1:-1])
 
-    # mean residual per bin
     bin_means = torch.zeros(n_bins, device=points.device)
     bin_counts = torch.zeros(n_bins, device=points.device)
     bin_counts.scatter_add_(0, bin_idx, torch.ones_like(t))
     bin_means.scatter_add_(0, bin_idx, residuals_sq.detach())
-    safe_counts = bin_counts.clamp(min=1)
-    bin_means = bin_means / safe_counts
+    bin_means = bin_means / bin_counts.clamp(min=1)
 
-    # cumulative residual and weights
     cumulative = torch.cumsum(bin_means, dim=0)
-    # shift so first bin has weight 1 (no penalty for earliest time)
     cumulative = torch.cat([torch.zeros(1, device=points.device), cumulative[:-1]])
     bin_weights = torch.exp(-epsilon * cumulative.clamp(max=20.0))
 
@@ -330,8 +345,44 @@ def causal_pde_loss(
         res_sq_detached = sq.sum(dim=1).detach()
         res_sq_live = sq.sum(dim=1)
 
+    # weights are detached (no grad) -- intentional per the paper
     weights = causal_weights(points, res_sq_detached, time_dim, epsilon, n_bins)
     return (weights * res_sq_live).mean(), res_sq_detached
+
+
+# ─── NTK-based adaptive loss weighting ─────────────────────────────────────
+
+
+def ntk_weights(
+    model: nn.Module,
+    losses: list[torch.Tensor],
+    eps: float = 1e-8,
+) -> list[float]:
+    """Compute NTK-based loss weights (Wang et al. 2021).
+
+    For each loss component, compute the NTK trace (sum of squared
+    per-parameter gradients). Weight each loss inversely proportional
+    to its trace, normalized so weights sum to len(losses).
+
+    Args:
+        model: neural network
+        losses: list of scalar loss tensors (must have grad_fn)
+        eps: numerical stability constant
+
+    Returns:
+        list of float weights, one per loss component
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    traces = []
+    for loss in losses:
+        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+        trace = sum(g.detach().pow(2).sum().item() for g in grads if g is not None)
+        traces.append(trace)
+
+    inv = [1.0 / (t + eps) for t in traces]
+    total = sum(inv)
+    n = len(losses)
+    return [w * n / total for w in inv]
 
 
 # ─── Adaptive resampling ────────────────────────────────────────────────────
@@ -363,11 +414,9 @@ def cosine_window(center: torch.Tensor, half_width: torch.Tensor) -> Callable:
     peaking at center and decaying to 0 at center +/- half_width.
     """
     def window(x: torch.Tensor) -> torch.Tensor:
-        # normalized distance in each dimension: 0 at center, 1 at edge
         dist = ((x - center) / half_width).abs()
-        # clamp to [0, 1] and apply cosine taper per dimension
         per_dim = 0.5 * (1.0 + torch.cos(math.pi * dist.clamp(max=1.0)))
-        return per_dim.prod(dim=-1)  # product over dimensions
+        return per_dim.prod(dim=-1)
 
     return window
 
@@ -391,7 +440,6 @@ def decompose_domain(
     if len(n_subdomains) != d:
         raise ValueError(f"n_subdomains length {len(n_subdomains)} != domain dims {d}")
 
-    # build 1D grids per dimension
     grids = []
     for dim in range(d):
         lo, hi = bounds[dim]
@@ -401,11 +449,10 @@ def decompose_domain(
         hw = width * (0.5 + overlap)
         grids.append([(c, hw) for c in centers])
 
-    # cartesian product of all dimensions
     subdomains = []
     for combo in itertools.product(*grids):
-        center = torch.tensor([c for c, _ in combo])
-        half_width = torch.tensor([hw for _, hw in combo])
+        center = torch.tensor([c for c, _ in combo], dtype=torch.float32)
+        half_width = torch.tensor([hw for _, hw in combo], dtype=torch.float32)
         sub_bounds = [
             (max(bounds[i][0], combo[i][0] - combo[i][1]),
              min(bounds[i][1], combo[i][0] + combo[i][1]))
@@ -424,14 +471,6 @@ class DDModel(nn.Module):
 
     Creates one MLP per subdomain, blends outputs using cosine windows
     (partition of unity).
-
-    Args:
-        layers: network architecture (same for all sub-networks)
-        subdomains: list from decompose_domain()
-        activation: activation function
-        fourier_features: Fourier encoding size (0 to disable)
-        fourier_sigma: Fourier frequency scale
-        norm: normalization type
     """
 
     def __init__(
@@ -449,28 +488,51 @@ class DDModel(nn.Module):
                 fourier_sigma=fourier_sigma, norm=norm)
             for _ in subdomains
         ])
-        # register window geometry as buffers so they move with .to(device)
         centers = torch.stack([sd["center"].float() for sd in subdomains])
         half_widths = torch.stack([sd["half_width"].float() for sd in subdomains])
-        self.register_buffer("_centers", centers)      # (n_sub, d)
-        self.register_buffer("_half_widths", half_widths)  # (n_sub, d)
+        self.register_buffer("_centers", centers)
+        self.register_buffer("_half_widths", half_widths)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # compute all window values inline using registered buffers
         w_list = []
         for i in range(self._centers.shape[0]):
             dist = ((x - self._centers[i]) / self._half_widths[i]).abs()
             per_dim = 0.5 * (1.0 + torch.cos(math.pi * dist.clamp(max=1.0)))
             w_list.append(per_dim.prod(dim=-1))
-        weights = torch.stack(w_list, dim=-1)  # (N, n_sub)
-        # normalize to partition of unity
+        weights = torch.stack(w_list, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-10)
 
-        # evaluate each sub-network
-        outputs = torch.stack([net(x) for net in self.subnets], dim=-1)  # (N, out, n_sub)
-        # blend: weighted sum over subdomains
-        weighted = outputs * weights.unsqueeze(1)  # (N, out, n_sub)
-        return weighted.sum(dim=-1)  # (N, out)
+        outputs = torch.stack([net(x) for net in self.subnets], dim=-1)
+        weighted = outputs * weights.unsqueeze(1)
+        return weighted.sum(dim=-1)
+
+
+# ─── Inverse problems ──────────────────────────────────────────────────────
+
+
+class InverseParams(nn.Module):
+    """Learnable PDE parameters for inverse problems.
+
+    Usage:
+        inv = InverseParams(k=1.0, alpha=0.5)
+        inv.k   # nn.Parameter(1.0)
+
+        def pde(net, x):
+            return -hessian(net, x)[0,0,0] - inv.k**2 * net(x)[0]
+
+        train(model, pde, bc, domain, extra_params=inv)
+    """
+
+    def __init__(self, **kwargs: float):
+        super().__init__()
+        for name, value in kwargs.items():
+            setattr(self, name, nn.Parameter(torch.tensor(float(value))))
+
+    def __getitem__(self, name: str) -> nn.Parameter:
+        return getattr(self, name)
+
+    def as_dict(self) -> dict[str, float]:
+        return {n: p.item() for n, p in self.named_parameters()}
 
 
 # ─── Checkpoints ────────────────────────────────────────────────────────────
@@ -482,6 +544,7 @@ def save_checkpoint(
     losses: list[float],
     config: dict,
     metadata: dict | None = None,
+    pde_params: dict | None = None,
 ) -> None:
     """Save model checkpoint with config and training history."""
     torch.save({
@@ -489,6 +552,7 @@ def save_checkpoint(
         "losses": losses,
         "config": config,
         "metadata": metadata or {},
+        "pde_params": pde_params or {},
     }, path)
 
 
@@ -497,15 +561,40 @@ def load_checkpoint(
     model: nn.Module | None = None,
     device: str = "cpu",
     weights_only: bool = True,
+    strict: bool = True,
 ) -> dict:
     """Load checkpoint. Optionally load weights into a model.
 
     Returns the full checkpoint dict (config, losses, metadata, model_state).
+    Set strict=False for transfer learning with architecture mismatches.
     """
     ckpt = torch.load(path, map_location=device, weights_only=weights_only)
     if model is not None:
-        model.load_state_dict(ckpt["model_state"])
+        model.load_state_dict(ckpt["model_state"], strict=strict)
     return ckpt
+
+
+# ─── Transfer learning ─────────────────────────────────────────────────────
+
+
+def freeze_layers(model: nn.Module, keep_last: int = 1) -> None:
+    """Freeze all layers except the last `keep_last` Linear layers.
+
+    For transfer learning: freeze early feature-extraction layers,
+    fine-tune only the final layers on new PDE parameters.
+    """
+    linears = [m for m in model.modules() if isinstance(m, nn.Linear)]
+    for param in model.parameters():
+        param.requires_grad = False
+    for layer in linears[-keep_last:]:
+        for param in layer.parameters():
+            param.requires_grad = True
+
+
+def unfreeze_all(model: nn.Module) -> None:
+    """Unfreeze all parameters (undo freeze_layers)."""
+    for param in model.parameters():
+        param.requires_grad = True
 
 
 # ─── Training loop ──────────────────────────────────────────────────────────
@@ -517,6 +606,7 @@ def train(
     bc_fn: Callable,
     domain: list[tuple[float, float]],
     *,
+    extra_params: nn.Module | list[nn.Parameter] | None = None,
     n_interior: int = 5000,
     adam_lr: float = 1e-3,
     adam_epochs: int = 5000,
@@ -530,6 +620,9 @@ def train(
     causal_epsilon: float = 1.0,
     causal_time_dim: int = -1,
     causal_n_bins: int = 20,
+    ntk_weighting: bool = False,
+    ntk_every: int = 100,
+    callback: Callable[[int, float], None] | None = None,
 ) -> list[float]:
     """Train PINN with Adam -> L-BFGS. Returns loss history.
 
@@ -538,6 +631,7 @@ def train(
         pde_fn: function(net, x) -> scalar or vector residual (single point)
         bc_fn: function(model, device) -> scalar BC loss
         domain: list of (lo, hi) bounds for each input dimension
+        extra_params: additional trainable params (e.g. InverseParams for inverse problems)
         n_interior: number of collocation points
         adam_lr: Adam learning rate
         adam_epochs: number of Adam epochs
@@ -551,9 +645,20 @@ def train(
         causal_epsilon: causality strength parameter
         causal_time_dim: which input dimension is time
         causal_n_bins: number of temporal bins for causal weighting
+        ntk_weighting: enable NTK-based adaptive loss balancing
+        ntk_every: recompute NTK weights every N epochs
+        callback: called as callback(epoch, loss) after each Adam epoch
     """
     torch.manual_seed(seed)
     losses: list[float] = []
+
+    # collect all trainable parameters
+    all_params = list(model.parameters())
+    if extra_params is not None:
+        if isinstance(extra_params, nn.Module):
+            all_params = all_params + list(extra_params.parameters())
+        else:
+            all_params = all_params + list(extra_params)
 
     # sample interior points
     pts = sobol(n_interior, domain, device=device).requires_grad_(True)
@@ -572,13 +677,16 @@ def train(
         except Exception as e:
             print(f"torch.compile failed, using eager mode: {e}")
 
+    # NTK adaptive weights: [pde_weight, bc_weight]
+    _ntk_w = [1.0, 1.0]
+
     def total_loss() -> tuple[torch.Tensor, torch.Tensor]:
         pl, res_sq = _loss_fn(model, pde_fn, pts)
         bl = bc_fn(model, device)
-        return pl + bl, res_sq
+        return _ntk_w[0] * pl + _ntk_w[1] * bl, res_sq
 
     # -- Phase 1: Adam --
-    optimizer = torch.optim.Adam(model.parameters(), lr=adam_lr)
+    optimizer = torch.optim.Adam(all_params, lr=adam_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=500, T_mult=2)
 
     t0 = time.perf_counter()
@@ -596,18 +704,27 @@ def train(
             dt = time.perf_counter() - t0
             print(f"[Adam {epoch:>5d}/{adam_epochs}] loss={lv:.4e} lr={optimizer.param_groups[0]['lr']:.2e} ({dt:.1f}s)")
 
+        # NTK rebalancing
+        if ntk_weighting and epoch % ntk_every == 0:
+            pl_ntk, _ = _loss_fn(model, pde_fn, pts)
+            bl_ntk = bc_fn(model, device)
+            _ntk_w = ntk_weights(model, [pl_ntk, bl_ntk])
+
         # adaptive resampling
         if resample_every > 0 and epoch % resample_every == 0:
             with torch.no_grad():
                 pts_new = resample(pts, res_sq.squeeze(), domain)
                 pts = pts_new.requires_grad_(True)
 
+        if callback is not None:
+            callback(epoch, lv)
+
     dt_adam = time.perf_counter() - t0
     print(f"Adam done in {dt_adam:.1f}s, loss={losses[-1]:.4e}")
 
-    # -- Phase 2: L-BFGS --
+    # -- Phase 2: L-BFGS (NTK weights frozen from end of Adam) --
     lbfgs = torch.optim.LBFGS(
-        model.parameters(),
+        all_params,
         lr=1.0,
         max_iter=lbfgs_max_iter,
         max_eval=lbfgs_max_iter,

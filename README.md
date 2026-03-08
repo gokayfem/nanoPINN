@@ -58,6 +58,14 @@ python train.py --problem=helmholtz_1d
 python train.py --problem=harmonic_oscillator
 python train.py --problem=advection_1d
 python train.py --problem=stokes_2d          # multi-output system (u, v, p)
+python train.py --problem=helmholtz_1d_inverse  # inverse problem
+python train.py --problem=heat_1d_inverse       # inverse problem
+```
+
+**I want to solve an inverse problem** (recover unknown PDE parameters):
+
+```
+python train.py --problem=helmholtz_1d_inverse
 ```
 
 **I want Fourier features for high-frequency solutions.**
@@ -82,6 +90,25 @@ python train.py --problem=heat_1d --causal=True
 
 ```
 python train.py --problem=poisson_2d --use_dd=True --dd_subdomains=3,3
+```
+
+**I want NTK-based adaptive loss balancing.**
+
+```
+python train.py --ntk_weighting=True --ntk_every=100
+```
+
+**I want transfer learning** (train on one PDE, fine-tune on another):
+
+```
+python train.py --problem=helmholtz_1d --save_to=helmholtz_k1.pt
+python train.py --problem=helmholtz_1d --transfer_from=helmholtz_k1.pt --unfreeze_after=1000
+```
+
+**I want multi-GPU training.**
+
+```
+torchrun --nproc_per_node=4 train_distributed.py --problem=poisson_2d
 ```
 
 **I want to use SIREN.** Switch the activation:
@@ -178,6 +205,52 @@ model = DDModel([2, 64, 1], subs)
 train(model, pde, bc, domain)
 ```
 
+### Inverse problems
+
+Learn unknown PDE parameters alongside the solution using observation data:
+
+```python
+from nanopinn import InverseParams, observation_loss, train
+
+inv = InverseParams(k=1.0)  # initial guess for unknown parameter
+
+def pde(net, x):
+    H = hessian(net, x)
+    return -H[0,0,0] - inv.k**2 * net(x)[0]  # k is learnable!
+
+train(model, pde, bc, domain, extra_params=inv)
+print(f"Recovered k = {inv.k.item():.4f}")
+```
+
+### NTK-based adaptive loss weighting
+
+Automatically balance PDE vs BC loss using Neural Tangent Kernel trace ratios (Wang et al. 2021):
+
+```python
+train(model, pde, bc, domain, ntk_weighting=True, ntk_every=100)
+```
+
+### Transfer learning
+
+Train on one PDE, fine-tune on another:
+
+```python
+from nanopinn import freeze_layers, unfreeze_all, load_checkpoint
+
+load_checkpoint("source.pt", model, strict=False)
+freeze_layers(model, keep_last=1)  # freeze all but final layer
+train(model, new_pde, new_bc, domain, adam_lr=1e-4)
+unfreeze_all(model)  # optional: full fine-tuning
+```
+
+### Multi-GPU training
+
+DDP-based distributed training via `torchrun`:
+
+```
+torchrun --nproc_per_node=4 train_distributed.py --problem=poisson_2d
+```
+
 ### Checkpoints
 
 Save and load trained models:
@@ -185,7 +258,7 @@ Save and load trained models:
 ```python
 from nanopinn import save_checkpoint, load_checkpoint
 
-save_checkpoint("model.pt", model, losses, config)
+save_checkpoint("model.pt", model, losses, config, pde_params={"k": 2.0})
 ckpt = load_checkpoint("model.pt", model)  # loads weights into model
 ```
 
@@ -215,6 +288,8 @@ Seven PDEs with exact analytical solutions, verified by the test suite:
 | `helmholtz_1d` | −u″ − k²u = f | [0, 1] | sin(πx) | 1 |
 | `advection_1d` | u_t + u_x = 0 | [0,2π]×[0,1] | sin(x − t) | 1 |
 | `stokes_2d` | Stokes flow | [0,1]² | manufactured | 3 (u,v,p) |
+| `helmholtz_1d_inverse` | −u″ − k²u = f (recover k) | [0,1] | sin(πx) | 1 |
+| `heat_1d_inverse` | u_t = αu_xx (recover α) | [0,1]×[0,0.5] | exact | 1 |
 
 ## benchmarks
 
@@ -269,31 +344,42 @@ boundary(n, bounds, device)  # points on faces     → (n, d)
 
 # ─── Loss ───
 pde_loss(model, pde_fn, points)     # vmapped PDE residual loss
+observation_loss(model, x_obs, u_obs)  # MSE for inverse problems
 causal_pde_loss(model, pde_fn, points, time_dim, epsilon, n_bins)
-causal_weights(points, residuals_sq, time_dim, epsilon, n_bins)
+ntk_weights(model, losses)          # NTK-based loss balancing
+
+# ─── Inverse problems ───
+InverseParams(k=1.0, alpha=0.5)     # learnable PDE parameters
 
 # ─── Domain decomposition ───
 cosine_window(center, half_width)    # window function factory
 decompose_domain(bounds, n_subdomains, overlap)
 
+# ─── Transfer learning ───
+freeze_layers(model, keep_last=1)    # freeze all but last N layers
+unfreeze_all(model)                  # undo freeze
+
 # ─── Checkpoints ───
-save_checkpoint(path, model, losses, config, metadata=None)
-load_checkpoint(path, model=None, device='cpu')
+save_checkpoint(path, model, losses, config, metadata=None, pde_params=None)
+load_checkpoint(path, model=None, device='cpu', strict=True)
 
 # ─── Training ───
 train(model, pde_fn, bc_fn, domain,
+      extra_params=None,             # InverseParams or list[Parameter]
       n_interior=5000, adam_lr=1e-3, adam_epochs=5000,
       lbfgs_max_iter=5000, do_compile=False,
       resample_every=500, log_every=100,
       device='cpu', seed=42,
       causal=False, causal_epsilon=1.0,
-      causal_time_dim=-1, causal_n_bins=20)
+      causal_time_dim=-1, causal_n_bins=20,
+      ntk_weighting=False, ntk_every=100,
+      callback=None)
 # Returns: list[float] (loss history)
 ```
 
 ## tests
 
-93 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, and benchmarks:
+131 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, benchmarks, inverse problems, NTK weighting, transfer learning, and distributed training:
 
 ```
 pip install pytest
@@ -319,16 +405,19 @@ The convergence tests actually train PINNs and verify the L2 relative error agai
 | Stokes 2D | < 25% |
 | SIREN on Poisson 1D | < 15% |
 | DD on Poisson 1D | < 15% |
+| Helmholtz inverse k recovery | < 25% param error |
 
 ## file structure
 
 ```
 nanopinn/
-├── nanopinn.py              # ~550 lines. the entire library.
-├── problems.py              # ~300 lines. 7 PDEs with exact solutions.
-├── train.py                 # ~140 lines. nanoGPT-style training script.
-├── benchmark.py             # ~200 lines. benchmark suite.
-├── generate_checkpoints.py  # ~70 lines. checkpoint generator.
+├── nanopinn.py              # ~760 lines. the entire library.
+├── nanopinn_distributed.py  # ~150 lines. multi-GPU DDP wrapper.
+├── problems.py              # ~440 lines. 9 PDEs with exact solutions.
+├── train.py                 # ~220 lines. nanoGPT-style training script.
+├── train_distributed.py     # ~100 lines. multi-GPU training script.
+├── benchmark.py             # ~280 lines. benchmark suite.
+├── generate_checkpoints.py  # ~95 lines. checkpoint generator.
 ├── pytest.ini
 └── tests/
     ├── test_derivatives.py    # jacobian/hessian vs autograd reference
@@ -338,7 +427,11 @@ nanopinn/
     ├── test_causal.py         # causal weighting + training
     ├── test_dd.py             # domain decomposition + DDModel
     ├── test_checkpoints.py    # save/load roundtrip
-    └── test_benchmark.py      # benchmark framework
+    ├── test_benchmark.py      # benchmark framework
+    ├── test_inverse.py        # inverse problems + parameter recovery
+    ├── test_ntk.py            # NTK-based adaptive weighting
+    ├── test_transfer.py       # freeze/unfreeze + transfer learning
+    └── test_distributed.py    # multi-GPU point distribution
 ```
 
 ## design philosophy
@@ -352,6 +445,7 @@ Stolen from the best:
 | [FBPINNs](https://github.com/benmoseley/FBPINNs) | `vmap` for batched per-point derivatives, domain decomposition |
 | [PyDEns](https://github.com/analysiscenter/pydens) | Minimal API surface — `D(f, x)` style operators |
 | [Wang et al. 2022](https://arxiv.org/abs/2203.07404) | Causal training for time-dependent PDEs |
+| [Wang et al. 2021](https://arxiv.org/abs/2001.04536) | NTK-based adaptive loss weighting |
 | [Tancik et al. 2020](https://arxiv.org/abs/2006.10739) | Fourier feature encoding for high-frequency solutions |
 
 What we deliberately left out:
@@ -370,7 +464,10 @@ What we deliberately left out:
 - [x] Causal training for time-dependent PDEs
 - [x] Benchmark suite with timing comparisons
 - [x] Pre-trained checkpoints for common problems
-- [ ] Inverse problems
-- [ ] Transfer learning across PDE parameters
-- [ ] Multi-GPU training
-- [ ] Adaptive loss weighting (NTK-based)
+- [x] Inverse problems (recover unknown PDE parameters)
+- [x] Transfer learning across PDE parameters
+- [x] Multi-GPU training (DDP via torchrun)
+- [x] Adaptive loss weighting (NTK-based)
+- [ ] Variational / energy-based formulations
+- [ ] Automatic differentiation order detection
+- [ ] Mesh-free collocation with adaptive refinement
