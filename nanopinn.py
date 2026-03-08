@@ -49,6 +49,20 @@ def laplacian(f: Callable, x: torch.Tensor, out_idx: int = 0) -> torch.Tensor:
     return torch.stack([H[out_idx, j, j] for j in range(x.shape[0])]).sum()
 
 
+def detect_diff_order(pde_fn: Callable) -> dict:
+    """Detect derivative orders used by pde_fn via AST inspection (best-effort heuristic)."""
+    import ast, inspect, textwrap
+    try:
+        src = textwrap.dedent(inspect.getsource(pde_fn))
+        tree = ast.parse(src)
+    except (OSError, TypeError, SyntaxError, IndentationError):
+        return {"max_order": 2, "uses_jacobian": True, "uses_hessian": True, "uses_laplacian": True}
+    names = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    j, h, l = ("jacobian" in names, "hessian" in names, "laplacian" in names)
+    return {"max_order": 2 if (h or l) else (1 if j else 0),
+            "uses_jacobian": j, "uses_hessian": h, "uses_laplacian": l}
+
+
 # ─── Network architectures ──────────────────────────────────────────────────
 
 
@@ -255,21 +269,22 @@ def pde_loss(
     return sq.mean(), sq.sum(dim=1).detach()
 
 
-def observation_loss(
-    model: nn.Module,
-    x_obs: torch.Tensor,
-    u_obs: torch.Tensor,
-) -> torch.Tensor:
-    """MSE between model predictions and observations (for inverse problems).
-
-    Args:
-        model: neural network
-        x_obs: observation locations (N_obs, d)
-        u_obs: observed values (N_obs, out) or (N_obs,)
-
-    Returns:
-        scalar MSE loss
+def energy_loss(
+    model: nn.Module, energy_fn: Callable,
+    points: torch.Tensor, domain: list[tuple[float, float]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Variational/energy loss via Monte Carlo integration.
+    energy_fn(net, x) returns scalar per-point energy density.
     """
+    energies = _vmapped_residuals(model, energy_fn, points)
+    volume = math.prod(hi - lo for lo, hi in domain)
+    return volume * energies.mean(), (energies ** 2).detach()
+
+
+def observation_loss(
+    model: nn.Module, x_obs: torch.Tensor, u_obs: torch.Tensor,
+) -> torch.Tensor:
+    """MSE between model predictions and observations (for inverse problems)."""
     pred = model(x_obs)
     target = u_obs.reshape(pred.shape) if u_obs.shape != pred.shape else u_obs
     return ((pred - target) ** 2).mean()
@@ -404,21 +419,26 @@ def resample(
     return torch.cat([kept, fresh], dim=0)
 
 
+def adaptive_refine(
+    points: torch.Tensor, residuals_sq: torch.Tensor,
+    bounds: list[tuple[float, float]],
+    n_add: int = 0, n_remove: int = 0, sigma: float = 0.05,
+) -> torch.Tensor:
+    """Add points near high-residual regions, remove from low-residual regions."""
+    n_remove = min(n_remove, points.shape[0] - 1)
+    _, idx = torch.sort(residuals_sq.view(-1), descending=True)
+    kept = points[idx[:points.shape[0] - n_remove]].detach()
+    if n_add <= 0:
+        return kept
+    seeds = points[idx[:n_add]].detach()
+    widths = torch.tensor([b[1] - b[0] for b in bounds], device=points.device)
+    new_pts = seeds + torch.randn_like(seeds) * sigma * widths
+    lo = torch.tensor([b[0] for b in bounds], device=points.device)
+    hi = torch.tensor([b[1] for b in bounds], device=points.device)
+    return torch.cat([kept, new_pts.clamp(min=lo, max=hi)], dim=0)
+
+
 # ─── Domain decomposition (FBPINNs-style) ──────────────────────────────────
-
-
-def cosine_window(center: torch.Tensor, half_width: torch.Tensor) -> Callable:
-    """Create a cosine bell window function.
-
-    Returns a function (N, d) -> (N,) with values in [0, 1],
-    peaking at center and decaying to 0 at center +/- half_width.
-    """
-    def window(x: torch.Tensor) -> torch.Tensor:
-        dist = ((x - center) / half_width).abs()
-        per_dim = 0.5 * (1.0 + torch.cos(math.pi * dist.clamp(max=1.0)))
-        return per_dim.prod(dim=-1)
-
-    return window
 
 
 def decompose_domain(
@@ -622,6 +642,10 @@ def train(
     causal_n_bins: int = 20,
     ntk_weighting: bool = False,
     ntk_every: int = 100,
+    energy_fn: Callable | None = None,
+    adaptive_refine_every: int = 0,
+    adaptive_refine_ratio: float = 0.1,
+    adaptive_refine_sigma: float = 0.05,
     callback: Callable[[int, float], None] | None = None,
 ) -> list[float]:
     """Train PINN with Adam -> L-BFGS. Returns loss history.
@@ -652,6 +676,10 @@ def train(
     torch.manual_seed(seed)
     losses: list[float] = []
 
+    if log_every > 0 and energy_fn is None:
+        _di = detect_diff_order(pde_fn)
+        print(f"PDE diff order: {_di['max_order']} (J={_di['uses_jacobian']}, H={_di['uses_hessian']}, L={_di['uses_laplacian']})")
+
     # collect all trainable parameters
     all_params = list(model.parameters())
     if extra_params is not None:
@@ -664,7 +692,10 @@ def train(
     pts = sobol(n_interior, domain, device=device).requires_grad_(True)
 
     # select loss function
-    if causal:
+    if energy_fn is not None:
+        def _loss_fn(model_, _pde, pts_):
+            return energy_loss(model_, energy_fn, pts_, domain)
+    elif causal:
         def _loss_fn(model_, pde_fn_, pts_):
             return causal_pde_loss(model_, pde_fn_, pts_, causal_time_dim, causal_epsilon, causal_n_bins)
     else:
@@ -715,6 +746,12 @@ def train(
             with torch.no_grad():
                 pts_new = resample(pts, res_sq.squeeze(), domain)
                 pts = pts_new.requires_grad_(True)
+
+        # adaptive refinement (targeted, near high-residual regions)
+        if adaptive_refine_every > 0 and epoch % adaptive_refine_every == 0:
+            with torch.no_grad():
+                n_ref = int(n_interior * adaptive_refine_ratio)
+                pts = adaptive_refine(pts, res_sq.squeeze(), domain, n_ref, n_ref, adaptive_refine_sigma).requires_grad_(True)
 
         if callback is not None:
             callback(epoch, lv)

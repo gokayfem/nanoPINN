@@ -116,6 +116,23 @@ CONFIGS = {
         "ntk_weighting": True,
         "ntk_every": 100,
     },
+    "variational": {
+        "activation": "tanh",
+        "fourier_features": 0,
+        "norm": "none",
+        "causal": False,
+        "use_dd": False,
+        "use_energy": True,
+    },
+    "adaptive": {
+        "activation": "tanh",
+        "fourier_features": 0,
+        "norm": "none",
+        "causal": False,
+        "use_dd": False,
+        "adaptive_refine_every": 200,
+        "adaptive_refine_ratio": 0.15,
+    },
 }
 
 
@@ -151,6 +168,15 @@ def run_benchmark(problem_name: str, config_name: str, cfg: dict) -> dict:
             "reason": "causal requires time_dim",
         }
 
+    # skip variational config for problems without energy function
+    if cfg.get("use_energy") and "energy" not in prob:
+        return {
+            "problem": problem_name,
+            "config": config_name,
+            "skipped": True,
+            "reason": "variational requires energy function",
+        }
+
     model = _build_model(prob, cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
 
@@ -178,12 +204,24 @@ def run_benchmark(problem_name: str, config_name: str, cfg: dict) -> dict:
             "ntk_every": cfg.get("ntk_every", 100),
         }
 
+    energy_kwargs = {}
+    if cfg.get("use_energy") and "energy" in prob:
+        energy_kwargs = {"energy_fn": prob["energy"]}
+
+    refine_kwargs = {}
+    if cfg.get("adaptive_refine_every", 0) > 0:
+        refine_kwargs = {
+            "adaptive_refine_every": cfg["adaptive_refine_every"],
+            "adaptive_refine_ratio": cfg.get("adaptive_refine_ratio", 0.1),
+            "adaptive_refine_sigma": cfg.get("adaptive_refine_sigma", 0.05),
+        }
+
     try:
         losses = train(
             model, pde_fn=prob["pde"], bc_fn=prob["bc"], domain=prob["domain"],
             n_interior=n_interior, adam_epochs=adam_epochs, lbfgs_max_iter=lbfgs_max_iter,
             log_every=log_every, device=device, seed=seed,
-            **causal_kwargs, **ntk_kwargs,
+            **causal_kwargs, **ntk_kwargs, **energy_kwargs, **refine_kwargs,
         )
     except Exception as e:
         return {

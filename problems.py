@@ -426,6 +426,38 @@ def heat_1d_inverse(true_alpha: float = 1.0, noise_std: float = 0.01, n_obs: int
     )
 
 
+# ─── 10. Poisson 1D Variational ─────────────────────────────────────────────
+# Variational form of Poisson: minimize E[u] = integral( 0.5*(du/dx)^2 - f*u ) dx
+# Uses only first-order derivatives (cheaper than strong form).
+
+def poisson_1d_variational():
+    base = poisson_1d()
+
+    def energy(net, x):
+        J = jacobian(net, x)
+        u = net(x)
+        f = (math.pi ** 2) * torch.sin(torch.tensor(math.pi) * x[0])
+        return 0.5 * J[0, 0] ** 2 - f * u[0]
+
+    return {**base, "energy": energy, "name": "poisson_1d_variational"}
+
+
+# ─── 11. Poisson 2D Variational ─────────────────────────────────────────────
+# E[u] = integral( 0.5*|grad u|^2 - f*u ) dA
+
+def poisson_2d_variational():
+    base = poisson_2d()
+
+    def energy(net, x):
+        J = jacobian(net, x)
+        u = net(x)
+        pi_t = torch.tensor(math.pi)
+        f = 2.0 * (math.pi ** 2) * torch.sin(pi_t * x[0]) * torch.sin(pi_t * x[1])
+        return 0.5 * (J[0, 0] ** 2 + J[0, 1] ** 2) - f * u[0]
+
+    return {**base, "energy": energy, "name": "poisson_2d_variational"}
+
+
 # ─── Registry ────────────────────────────────────────────────────────────────
 
 PROBLEMS = {
@@ -438,4 +470,6 @@ PROBLEMS = {
     "stokes_2d": stokes_2d,
     "helmholtz_1d_inverse": helmholtz_1d_inverse,
     "heat_1d_inverse": heat_1d_inverse,
+    "poisson_1d_variational": poisson_1d_variational,
+    "poisson_2d_variational": poisson_2d_variational,
 }

@@ -10,6 +10,8 @@ Single-file, config via globals, override from CLI:
     python train.py --problem=helmholtz_1d_inverse  # inverse problem
     python train.py --ntk_weighting=True            # NTK loss balancing
     python train.py --transfer_from=helmholtz_1d.pt # transfer learning
+    python train.py --problem=poisson_1d_variational --use_energy=True  # variational
+    python train.py --adaptive_refine_every=200     # adaptive mesh refinement
 """
 
 import sys
@@ -64,6 +66,14 @@ causal_n_bins = 20
 # NTK adaptive weighting
 ntk_weighting = False
 ntk_every = 100
+
+# variational / energy formulation
+use_energy = False
+
+# adaptive refinement
+adaptive_refine_every = 0  # 0 to disable
+adaptive_refine_ratio = 0.1
+adaptive_refine_sigma = 0.05
 
 # transfer learning
 transfer_from = ""  # path to source checkpoint
@@ -166,6 +176,12 @@ if unfreeze_after > 0:
             unfreeze_all(model)
             print(f"[epoch {epoch}] Unfroze all layers")
 
+# energy function for variational mode
+_energy_fn = None
+if use_energy and "energy" in prob:
+    _energy_fn = prob["energy"]
+    print("Using variational/energy formulation")
+
 model.train()
 losses = train(
     model,
@@ -188,6 +204,10 @@ losses = train(
     causal_n_bins=causal_n_bins,
     ntk_weighting=ntk_weighting,
     ntk_every=ntk_every,
+    energy_fn=_energy_fn,
+    adaptive_refine_every=adaptive_refine_every,
+    adaptive_refine_ratio=adaptive_refine_ratio,
+    adaptive_refine_sigma=adaptive_refine_sigma,
     callback=_callback,
 )
 

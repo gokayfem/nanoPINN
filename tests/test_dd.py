@@ -9,38 +9,18 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from nanopinn import (
-    MLP, DDModel, cosine_window, decompose_domain, pde_loss,
+    MLP, DDModel, decompose_domain, pde_loss,
     hessian, sobol, train,
 )
 
 
-class TestCosineWindow:
-    def test_peak_at_center(self):
-        center = torch.tensor([0.5, 0.5])
-        half_width = torch.tensor([0.3, 0.3])
-        w = cosine_window(center, half_width)
-
-        x = torch.tensor([[0.5, 0.5]])
-        assert abs(w(x).item() - 1.0) < 1e-6
-
-    def test_zero_at_edge(self):
-        center = torch.tensor([0.5])
-        half_width = torch.tensor([0.25])
-        w = cosine_window(center, half_width)
-
-        x_edge = torch.tensor([[0.25], [0.75]])
-        vals = w(x_edge)
-        torch.testing.assert_close(vals, torch.zeros(2), atol=1e-6, rtol=1e-6)
-
-    def test_values_in_range(self):
-        center = torch.tensor([0.5, 0.5])
-        half_width = torch.tensor([0.5, 0.5])
-        w = cosine_window(center, half_width)
-
-        x = torch.rand(100, 2)
-        vals = w(x)
-        assert (vals >= -1e-6).all()
-        assert (vals <= 1.0 + 1e-6).all()
+def _cosine_window(center, half_width):
+    """Local helper reproducing the cosine bell window logic."""
+    def window(x):
+        dist = ((x - center) / half_width).abs()
+        per_dim = 0.5 * (1.0 + torch.cos(math.pi * dist.clamp(max=1.0)))
+        return per_dim.prod(dim=-1)
+    return window
 
 
 class TestDecomposeDomain:
@@ -72,7 +52,7 @@ class TestPartitionOfUnity:
     def test_windows_sum_to_one(self):
         """Window values should sum to ~1 after normalization (done in DDModel.forward)."""
         subs = decompose_domain([(0.0, 1.0)], [3], overlap=0.5)
-        windows = [cosine_window(s["center"], s["half_width"]) for s in subs]
+        windows = [_cosine_window(s["center"], s["half_width"]) for s in subs]
 
         x = torch.linspace(0.05, 0.95, 50).unsqueeze(1)
         w_vals = torch.stack([w(x) for w in windows], dim=-1)

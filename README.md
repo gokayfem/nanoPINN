@@ -1,6 +1,6 @@
 # nanoPINN
 
-The simplest, fastest repository for training Physics-Informed Neural Networks. It is a rewrite of the PINN paradigm that prioritizes teeth over education, inspired by [nanoGPT](https://github.com/karpathy/nanoGPT). The file `nanopinn.py` is a ~550-line library that gives you `jacobian`, `hessian`, `MLP`, Fourier features, domain decomposition, causal training, and a hybrid Adam→L-BFGS training loop. The file `train.py` is a ~140-line nanoGPT-style training script with config-as-globals. That's it.
+The simplest, fastest repository for training Physics-Informed Neural Networks. It is a rewrite of the PINN paradigm that prioritizes teeth over education, inspired by [nanoGPT](https://github.com/karpathy/nanoGPT). The file `nanopinn.py` is a ~800-line library that gives you `jacobian`, `hessian`, `MLP`, Fourier features, domain decomposition, causal training, variational formulations, adaptive mesh refinement, and a hybrid Adam→L-BFGS training loop. The file `train.py` is a ~250-line nanoGPT-style training script with config-as-globals. That's it.
 
 Because the code is so simple, it is very easy to hack to your needs: define any PDE as a plain Python function, pick an activation, and train.
 
@@ -60,6 +60,7 @@ python train.py --problem=advection_1d
 python train.py --problem=stokes_2d          # multi-output system (u, v, p)
 python train.py --problem=helmholtz_1d_inverse  # inverse problem
 python train.py --problem=heat_1d_inverse       # inverse problem
+python train.py --problem=poisson_1d_variational --use_energy=True  # variational
 ```
 
 **I want to solve an inverse problem** (recover unknown PDE parameters):
@@ -103,6 +104,18 @@ python train.py --ntk_weighting=True --ntk_every=100
 ```
 python train.py --problem=helmholtz_1d --save_to=helmholtz_k1.pt
 python train.py --problem=helmholtz_1d --transfer_from=helmholtz_k1.pt --unfreeze_after=1000
+```
+
+**I want variational/energy-based formulation** (only first-order derivatives needed):
+
+```
+python train.py --problem=poisson_1d_variational --use_energy=True
+```
+
+**I want adaptive mesh refinement** (concentrate points in high-residual regions):
+
+```
+python train.py --adaptive_refine_every=200 --adaptive_refine_ratio=0.15
 ```
 
 **I want multi-GPU training.**
@@ -243,6 +256,47 @@ train(model, new_pde, new_bc, domain, adam_lr=1e-4)
 unfreeze_all(model)  # optional: full fine-tuning
 ```
 
+### Variational / energy-based formulations
+
+Minimize an energy functional instead of squaring PDE residuals. Only requires first-order derivatives (cheaper than strong form for many problems):
+
+```python
+from nanopinn import energy_loss, jacobian, train
+
+def energy(net, x):
+    J = jacobian(net, x)
+    u = net(x)
+    f = (math.pi ** 2) * torch.sin(math.pi * x[0])
+    return 0.5 * J[0, 0] ** 2 - f * u[0]  # Dirichlet energy for Poisson
+
+train(model, pde, bc, domain, energy_fn=energy)
+```
+
+### Automatic differentiation order detection
+
+Automatically detects which derivative operators (`jacobian`, `hessian`, `laplacian`) your PDE function uses:
+
+```python
+from nanopinn import detect_diff_order
+info = detect_diff_order(my_pde_fn)
+# {"max_order": 2, "uses_jacobian": True, "uses_hessian": True, "uses_laplacian": False}
+```
+
+This is printed automatically at the start of training for diagnostic purposes.
+
+### Adaptive mesh refinement
+
+Concentrate collocation points in high-residual regions via Gaussian perturbation of seed points:
+
+```python
+train(model, pde, bc, domain,
+      adaptive_refine_every=200,    # refine every 200 epochs
+      adaptive_refine_ratio=0.15,   # replace 15% of points
+      adaptive_refine_sigma=0.05)   # noise scale relative to domain width
+```
+
+Can be combined with `resample_every` for both global refresh and targeted refinement.
+
 ### Multi-GPU training
 
 DDP-based distributed training via `torchrun`:
@@ -277,7 +331,7 @@ The training loop also supports:
 
 ## built-in problems
 
-Seven PDEs with exact analytical solutions, verified by the test suite:
+Nine forward + two inverse + two variational PDEs with exact analytical solutions, verified by the test suite:
 
 | Problem | Equation | Domain | Exact Solution | Outputs |
 |---------|----------|--------|----------------|---------|
@@ -290,6 +344,8 @@ Seven PDEs with exact analytical solutions, verified by the test suite:
 | `stokes_2d` | Stokes flow | [0,1]² | manufactured | 3 (u,v,p) |
 | `helmholtz_1d_inverse` | −u″ − k²u = f (recover k) | [0,1] | sin(πx) | 1 |
 | `heat_1d_inverse` | u_t = αu_xx (recover α) | [0,1]×[0,0.5] | exact | 1 |
+| `poisson_1d_variational` | E[u] = ∫(½u'² − fu)dx | [0,1] | sin(πx) | 1 |
+| `poisson_2d_variational` | E[u] = ∫(½\|∇u\|² − fu)dA | [0,1]² | sin(πx)sin(πy) | 1 |
 
 ## benchmarks
 
@@ -330,6 +386,7 @@ The entire library is in `nanopinn.py`. Here's everything it exports:
 jacobian(f, x)              # f:(d,)→(m,), x:(d,) → (m, d)
 hessian(f, x)               # f:(d,)→(m,), x:(d,) → (m, d, d)
 laplacian(f, x, out_idx=0)  # sum of d²f/dx_i²  → scalar
+detect_diff_order(pde_fn)   # detect which operators pde_fn uses
 
 # ─── Networks ───
 FourierFeatures(in_features, mapping_size, sigma=1.0)
@@ -344,6 +401,7 @@ boundary(n, bounds, device)  # points on faces     → (n, d)
 
 # ─── Loss ───
 pde_loss(model, pde_fn, points)     # vmapped PDE residual loss
+energy_loss(model, energy_fn, points, domain)  # variational/energy loss
 observation_loss(model, x_obs, u_obs)  # MSE for inverse problems
 causal_pde_loss(model, pde_fn, points, time_dim, epsilon, n_bins)
 ntk_weights(model, losses)          # NTK-based loss balancing
@@ -351,8 +409,12 @@ ntk_weights(model, losses)          # NTK-based loss balancing
 # ─── Inverse problems ───
 InverseParams(k=1.0, alpha=0.5)     # learnable PDE parameters
 
+# ─── Adaptive sampling ───
+resample(points, residuals_sq, bounds, ratio)  # global Sobol refresh
+adaptive_refine(points, residuals_sq, bounds,  # targeted refinement
+                n_add, n_remove, sigma)
+
 # ─── Domain decomposition ───
-cosine_window(center, half_width)    # window function factory
 decompose_domain(bounds, n_subdomains, overlap)
 
 # ─── Transfer learning ───
@@ -373,13 +435,17 @@ train(model, pde_fn, bc_fn, domain,
       causal=False, causal_epsilon=1.0,
       causal_time_dim=-1, causal_n_bins=20,
       ntk_weighting=False, ntk_every=100,
+      energy_fn=None,                      # variational formulation
+      adaptive_refine_every=0,             # 0 to disable
+      adaptive_refine_ratio=0.1,
+      adaptive_refine_sigma=0.05,
       callback=None)
 # Returns: list[float] (loss history)
 ```
 
 ## tests
 
-131 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, benchmarks, inverse problems, NTK weighting, transfer learning, and distributed training:
+146 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, benchmarks, inverse problems, NTK weighting, transfer learning, distributed training, variational formulations, diff order detection, and adaptive refinement:
 
 ```
 pip install pytest
@@ -411,12 +477,12 @@ The convergence tests actually train PINNs and verify the L2 relative error agai
 
 ```
 nanopinn/
-├── nanopinn.py              # ~760 lines. the entire library.
+├── nanopinn.py              # ~795 lines. the entire library.
 ├── nanopinn_distributed.py  # ~150 lines. multi-GPU DDP wrapper.
-├── problems.py              # ~440 lines. 9 PDEs with exact solutions.
-├── train.py                 # ~220 lines. nanoGPT-style training script.
+├── problems.py              # ~500 lines. 11 PDEs with exact solutions.
+├── train.py                 # ~250 lines. nanoGPT-style training script.
 ├── train_distributed.py     # ~100 lines. multi-GPU training script.
-├── benchmark.py             # ~280 lines. benchmark suite.
+├── benchmark.py             # ~320 lines. benchmark suite.
 ├── generate_checkpoints.py  # ~95 lines. checkpoint generator.
 ├── pytest.ini
 └── tests/
@@ -431,7 +497,10 @@ nanopinn/
     ├── test_inverse.py        # inverse problems + parameter recovery
     ├── test_ntk.py            # NTK-based adaptive weighting
     ├── test_transfer.py       # freeze/unfreeze + transfer learning
-    └── test_distributed.py    # multi-GPU point distribution
+    ├── test_distributed.py    # multi-GPU point distribution
+    ├── test_variational.py    # energy-based formulations
+    ├── test_diff_detect.py    # auto diff order detection
+    └── test_adaptive_refine.py # adaptive mesh refinement
 ```
 
 ## design philosophy
@@ -468,6 +537,6 @@ What we deliberately left out:
 - [x] Transfer learning across PDE parameters
 - [x] Multi-GPU training (DDP via torchrun)
 - [x] Adaptive loss weighting (NTK-based)
-- [ ] Variational / energy-based formulations
-- [ ] Automatic differentiation order detection
-- [ ] Mesh-free collocation with adaptive refinement
+- [x] Variational / energy-based formulations
+- [x] Automatic differentiation order detection
+- [x] Mesh-free collocation with adaptive refinement
