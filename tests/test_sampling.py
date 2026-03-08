@@ -7,7 +7,7 @@ import torch
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from nanopinn import sobol, uniform, boundary
+from nanopinn import sobol, uniform, boundary, lhs
 
 
 class TestSobol:
@@ -49,6 +49,38 @@ class TestUniform:
         assert pts[:, 0].max() <= 3.0
         assert pts[:, 1].min() >= 0.0
         assert pts[:, 1].max() <= 10.0
+
+
+class TestLHS:
+    def test_shape(self):
+        pts = lhs(100, [(0, 1), (0, 1)])
+        assert pts.shape == (100, 2)
+
+    def test_bounds(self):
+        pts = lhs(1000, [(-2, 3), (0, 10)])
+        assert pts[:, 0].min() >= -2.0
+        assert pts[:, 0].max() <= 3.0
+        assert pts[:, 1].min() >= 0.0
+        assert pts[:, 1].max() <= 10.0
+
+    def test_1d(self):
+        pts = lhs(50, [(0, 1)])
+        assert pts.shape == (50, 1)
+        assert pts.min() >= 0.0
+        assert pts.max() <= 1.0
+
+    def test_stratification(self):
+        """Each stratum should have exactly one point per dimension."""
+        n = 100
+        pts = lhs(n, [(0, 1)])
+        # Bin into n strata — each stratum should have exactly 1 point
+        bins = (pts[:, 0] * n).long().clamp(0, n - 1)
+        assert bins.unique().shape[0] == n
+
+    def test_different_each_call(self):
+        pts1 = lhs(50, [(0, 1), (0, 1)])
+        pts2 = lhs(50, [(0, 1), (0, 1)])
+        assert not torch.allclose(pts1, pts2)
 
 
 class TestBoundary:

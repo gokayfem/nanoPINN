@@ -426,7 +426,50 @@ def heat_1d_inverse(true_alpha: float = 1.0, noise_std: float = 0.01, n_obs: int
     )
 
 
-# ─── 10. Poisson 1D Variational ─────────────────────────────────────────────
+# ─── 10. Burgers 1D ────────────────────────────────────────────────────────
+# u_t + u*u_x - ν*u_xx = f(x,t) on (-1,1) x (0,1)
+# Manufactured solution: u(x,t) = -sin(πx)*exp(-νπ²t)
+# Source term: f = (π/2)*sin(2πx)*exp(-2νπ²t)
+# IC: u(x,0) = -sin(πx), BC: u(-1,t) = u(1,t) = 0
+
+def burgers_1d(nu: float = 0.01 / math.pi):
+    domain = [(-1.0, 1.0), (0.0, 1.0)]
+    layers = [2, 64, 64, 64, 1]
+    nu_pi2 = nu * math.pi ** 2
+
+    def pde(net, x):
+        J = jacobian(net, x)
+        H = hessian(net, x)
+        u = net(x)
+        pi_t = torch.tensor(math.pi)
+        f = (math.pi / 2) * torch.sin(2 * pi_t * x[0]) * torch.exp(-2 * nu_pi2 * x[1])
+        return J[0, 1] + u[0] * J[0, 0] - nu * H[0, 0, 0] - f
+
+    def bc(model, device):
+        n = 200
+        # IC: u(x, 0) = -sin(πx)
+        x_ic = sobol(n, [(-1.0, 1.0)], device=device)
+        t_ic = torch.zeros(n, 1, device=device)
+        pts_ic = torch.cat([x_ic, t_ic], dim=1)
+        target_ic = -torch.sin(math.pi * x_ic)
+        loss_ic = ((model(pts_ic) - target_ic) ** 2).mean()
+
+        # BC: u(-1, t) = u(1, t) = 0
+        t_bc = sobol(n, [(0.0, 1.0)], device=device)
+        pts_l = torch.cat([-torch.ones(n, 1, device=device), t_bc], dim=1)
+        pts_r = torch.cat([torch.ones(n, 1, device=device), t_bc], dim=1)
+        loss_bc = (model(pts_l) ** 2).mean() + (model(pts_r) ** 2).mean()
+
+        return loss_ic + loss_bc
+
+    def exact(x):
+        return -torch.sin(math.pi * x[:, 0:1]) * torch.exp(-nu_pi2 * x[:, 1:2])
+
+    return dict(pde=pde, bc=bc, domain=domain, exact=exact, layers=layers,
+                name="burgers_1d", time_dim=1)
+
+
+# ─── 11. Poisson 1D Variational ─────────────────────────────────────────────
 # Variational form of Poisson: minimize E[u] = integral( 0.5*(du/dx)^2 - f*u ) dx
 # Uses only first-order derivatives (cheaper than strong form).
 
@@ -470,6 +513,7 @@ PROBLEMS = {
     "stokes_2d": stokes_2d,
     "helmholtz_1d_inverse": helmholtz_1d_inverse,
     "heat_1d_inverse": heat_1d_inverse,
+    "burgers_1d": burgers_1d,
     "poisson_1d_variational": poisson_1d_variational,
     "poisson_2d_variational": poisson_2d_variational,
 }

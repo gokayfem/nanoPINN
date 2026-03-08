@@ -19,7 +19,7 @@ import tracemalloc
 
 import torch
 
-from nanopinn import MLP, DDModel, decompose_domain, save_checkpoint, sobol, train
+from nanopinn import MLP, ResNet, DDModel, decompose_domain, save_checkpoint, sobol, train
 from problems import PROBLEMS
 
 # ─── config ──────────────────────────────────────────────────────────────────
@@ -133,6 +133,23 @@ CONFIGS = {
         "adaptive_refine_every": 200,
         "adaptive_refine_ratio": 0.15,
     },
+    "resnet": {
+        "activation": "tanh",
+        "fourier_features": 0,
+        "norm": "none",
+        "causal": False,
+        "use_dd": False,
+        "architecture": "resnet",
+    },
+    "resnet_beta": {
+        "activation": "tanh",
+        "fourier_features": 0,
+        "norm": "none",
+        "causal": False,
+        "use_dd": False,
+        "architecture": "resnet",
+        "resnet_tune_beta": True,
+    },
 }
 
 
@@ -152,6 +169,9 @@ def _build_model(prob, cfg):
         subdomains = decompose_domain(prob["domain"], nsub, cfg.get("dd_overlap", 0.25))
         return DDModel(layers, subdomains, activation=act,
                        fourier_features=ff, fourier_sigma=fs, norm=nm)
+    if cfg.get("architecture") == "resnet":
+        return ResNet(layers, activation=act, tune_beta=cfg.get("resnet_tune_beta", False),
+                      fourier_features=ff, fourier_sigma=fs, norm=nm)
     return MLP(layers, activation=act, fourier_features=ff, fourier_sigma=fs, norm=nm)
 
 

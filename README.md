@@ -1,6 +1,6 @@
 # nanoPINN
 
-The simplest, fastest repository for training Physics-Informed Neural Networks. It is a rewrite of the PINN paradigm that prioritizes teeth over education, inspired by [nanoGPT](https://github.com/karpathy/nanoGPT). The file `nanopinn.py` is a ~800-line library that gives you `jacobian`, `hessian`, `MLP`, Fourier features, domain decomposition, causal training, variational formulations, adaptive mesh refinement, and a hybrid Adam→L-BFGS training loop. The file `train.py` is a ~250-line nanoGPT-style training script with config-as-globals. That's it.
+The simplest, fastest repository for training Physics-Informed Neural Networks. It is a rewrite of the PINN paradigm that prioritizes teeth over education, inspired by [nanoGPT](https://github.com/karpathy/nanoGPT). The file `nanopinn.py` is a ~880-line library that gives you `jacobian`, `hessian`, `MLP`, `ResNet`, Fourier features, domain decomposition, causal training, variational formulations, adaptive mesh refinement, Latin Hypercube Sampling, and a hybrid Adam→L-BFGS training loop. The file `train.py` is a ~250-line nanoGPT-style training script with config-as-globals. That's it.
 
 Because the code is so simple, it is very easy to hack to your needs: define any PDE as a plain Python function, pick an activation, and train.
 
@@ -61,6 +61,7 @@ python train.py --problem=stokes_2d          # multi-output system (u, v, p)
 python train.py --problem=helmholtz_1d_inverse  # inverse problem
 python train.py --problem=heat_1d_inverse       # inverse problem
 python train.py --problem=poisson_1d_variational --use_energy=True  # variational
+python train.py --problem=burgers_1d              # Burgers equation
 ```
 
 **I want to solve an inverse problem** (recover unknown PDE parameters):
@@ -116,6 +117,13 @@ python train.py --problem=poisson_1d_variational --use_energy=True
 
 ```
 python train.py --adaptive_refine_every=200 --adaptive_refine_ratio=0.15
+```
+
+**I want a ResNet** (skip connections for deeper networks):
+
+```
+python train.py --architecture=resnet
+python train.py --architecture=resnet --resnet_tune_beta=True  # learnable activation scaling
 ```
 
 **I want multi-GPU training.**
@@ -297,6 +305,30 @@ train(model, pde, bc, domain,
 
 Can be combined with `resample_every` for both global refresh and targeted refinement.
 
+### ResNet architecture
+
+Residual network with skip connections for deeper PINNs. Supports learnable activation scaling (`tune_beta`) that scales each hidden layer's pre-activation by a trainable parameter:
+
+```python
+from nanopinn import ResNet
+
+model = ResNet([2, 64, 64, 64, 1])  # all hidden dims must be equal
+model = ResNet([2, 64, 64, 64, 1], tune_beta=True)  # learnable β per layer
+model = ResNet([2, 64, 64, 64, 1], activation='gelu', norm='spectral')
+```
+
+Note: ResNet does not support SIREN activation (incompatible with skip connections). Use `tanh`, `gelu`, `swish`, or `sigmoid`.
+
+### Latin Hypercube Sampling
+
+Stratified sampling for better domain coverage than uniform random. Each dimension is divided into `n` equal strata with exactly one sample per stratum:
+
+```python
+from nanopinn import lhs
+
+pts = lhs(1000, [(0, 1), (0, 1)])  # 1000 points in unit square
+```
+
 ### Multi-GPU training
 
 DDP-based distributed training via `torchrun`:
@@ -331,7 +363,7 @@ The training loop also supports:
 
 ## built-in problems
 
-Nine forward + two inverse + two variational PDEs with exact analytical solutions, verified by the test suite:
+Ten forward + two inverse + two variational PDEs with exact analytical solutions, verified by the test suite:
 
 | Problem | Equation | Domain | Exact Solution | Outputs |
 |---------|----------|--------|----------------|---------|
@@ -344,6 +376,7 @@ Nine forward + two inverse + two variational PDEs with exact analytical solution
 | `stokes_2d` | Stokes flow | [0,1]² | manufactured | 3 (u,v,p) |
 | `helmholtz_1d_inverse` | −u″ − k²u = f (recover k) | [0,1] | sin(πx) | 1 |
 | `heat_1d_inverse` | u_t = αu_xx (recover α) | [0,1]×[0,0.5] | exact | 1 |
+| `burgers_1d` | u_t + uu_x = νu_xx + f | [−1,1]×[0,1] | −sin(πx)e^(−νπ²t) | 1 |
 | `poisson_1d_variational` | E[u] = ∫(½u'² − fu)dx | [0,1] | sin(πx) | 1 |
 | `poisson_2d_variational` | E[u] = ∫(½\|∇u\|² − fu)dA | [0,1]² | sin(πx)sin(πy) | 1 |
 
@@ -392,11 +425,14 @@ detect_diff_order(pde_fn)   # detect which operators pde_fn uses
 FourierFeatures(in_features, mapping_size, sigma=1.0)
 MLP(layers, activation='tanh', omega_0=30.0,
     fourier_features=0, fourier_sigma=1.0, norm='none')
+ResNet(layers, activation='tanh', tune_beta=False,
+       fourier_features=0, fourier_sigma=1.0, norm='none')
 DDModel(layers, subdomains, activation='tanh', ...)
 
 # ─── Sampling ───
 sobol(n, bounds, device)     # Sobol quasi-random  → (n, d)
 uniform(n, bounds, device)   # uniform random      → (n, d)
+lhs(n, bounds, device)       # Latin Hypercube     → (n, d)
 boundary(n, bounds, device)  # points on faces     → (n, d)
 
 # ─── Loss ───
@@ -445,7 +481,7 @@ train(model, pde_fn, bc_fn, domain,
 
 ## tests
 
-146 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, benchmarks, inverse problems, NTK weighting, transfer learning, distributed training, variational formulations, diff order detection, and adaptive refinement:
+168 tests covering derivatives, models, sampling, convergence, causal training, domain decomposition, checkpoints, benchmarks, inverse problems, NTK weighting, transfer learning, distributed training, variational formulations, diff order detection, adaptive refinement, ResNet architecture, and Latin Hypercube Sampling:
 
 ```
 pip install pytest
@@ -477,9 +513,9 @@ The convergence tests actually train PINNs and verify the L2 relative error agai
 
 ```
 nanopinn/
-├── nanopinn.py              # ~795 lines. the entire library.
+├── nanopinn.py              # ~880 lines. the entire library.
 ├── nanopinn_distributed.py  # ~150 lines. multi-GPU DDP wrapper.
-├── problems.py              # ~500 lines. 11 PDEs with exact solutions.
+├── problems.py              # ~550 lines. 14 PDEs with exact solutions.
 ├── train.py                 # ~250 lines. nanoGPT-style training script.
 ├── train_distributed.py     # ~100 lines. multi-GPU training script.
 ├── benchmark.py             # ~320 lines. benchmark suite.
@@ -500,7 +536,8 @@ nanopinn/
     ├── test_distributed.py    # multi-GPU point distribution
     ├── test_variational.py    # energy-based formulations
     ├── test_diff_detect.py    # auto diff order detection
-    └── test_adaptive_refine.py # adaptive mesh refinement
+    ├── test_adaptive_refine.py # adaptive mesh refinement
+    └── test_resnet.py         # ResNet architecture + skip connections
 ```
 
 ## design philosophy
@@ -540,3 +577,6 @@ What we deliberately left out:
 - [x] Variational / energy-based formulations
 - [x] Automatic differentiation order detection
 - [x] Mesh-free collocation with adaptive refinement
+- [x] ResNet architecture with skip connections and learnable beta
+- [x] Latin Hypercube Sampling
+- [x] Burgers equation benchmark

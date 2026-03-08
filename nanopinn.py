@@ -184,6 +184,90 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+class ResNet(nn.Module):
+    """Residual network with skip connections. Same layers API as MLP.
+
+    Architecture: input → first_layer → [hidden + skip] × N → output_layer.
+    All hidden dims must be equal (for residual addition).
+
+    Args:
+        layers: list of layer sizes, e.g. [2, 64, 64, 64, 1]
+        activation: 'tanh' | 'gelu' | 'swish' | 'sigmoid'
+        fourier_features: number of Fourier features (0 to disable)
+        fourier_sigma: frequency scale for Fourier features
+        norm: 'none' | 'weight' | 'spectral'
+        tune_beta: learnable activation scaling per layer (improves convergence)
+    """
+
+    def __init__(
+        self,
+        layers: list[int],
+        activation: str = "tanh",
+        fourier_features: int = 0,
+        fourier_sigma: float = 1.0,
+        norm: str = "none",
+        tune_beta: bool = False,
+    ):
+        super().__init__()
+        if len(layers) < 3:
+            raise ValueError(f"ResNet requires at least 3 layers [in, hidden, out], got {len(layers)}")
+        hidden_dims = layers[1:-1]
+        if len(set(hidden_dims)) != 1:
+            raise ValueError(
+                f"ResNet requires all hidden dims to be equal for skip connections, got {hidden_dims}"
+            )
+
+        acts = {"tanh": nn.Tanh, "gelu": nn.GELU, "swish": nn.SiLU, "sigmoid": nn.Sigmoid}
+        if activation == "siren":
+            raise ValueError(
+                "ResNet does not support SIREN activation. "
+                "SIREN requires per-layer omega_0 initialization incompatible with skip connections. "
+                "Use 'tanh', 'gelu', 'swish', or 'sigmoid'."
+            )
+        if activation not in acts:
+            raise ValueError(f"Unknown activation '{activation}'. Choose from {list(acts.keys())}")
+
+        self.fourier = None
+        in_dim = layers[0]
+        if fourier_features > 0:
+            self.fourier = FourierFeatures(in_dim, fourier_features, fourier_sigma)
+            in_dim = 2 * fourier_features
+
+        hidden, out_dim = layers[1], layers[-1]
+        n_hidden = len(layers) - 2
+
+        self.first = nn.Linear(in_dim, hidden)
+        self.blocks = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(n_hidden)])
+        self.last = nn.Linear(hidden, out_dim)
+        self.act = acts[activation]()
+
+        if tune_beta:
+            self.beta0 = nn.Parameter(torch.ones(1))
+            self.betas = nn.Parameter(torch.ones(n_hidden))
+        else:
+            self.register_buffer("beta0", torch.ones(1))
+            self.register_buffer("betas", torch.ones(n_hidden))
+
+        nn.init.xavier_normal_(self.first.weight)
+        nn.init.zeros_(self.first.bias)
+        for layer in self.blocks:
+            nn.init.xavier_normal_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.xavier_normal_(self.last.weight)
+        nn.init.zeros_(self.last.bias)
+
+        if norm != "none":
+            _apply_norm(self, norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fourier is not None:
+            x = self.fourier(x)
+        x = self.act(self.beta0 * self.first(x))
+        for i, layer in enumerate(self.blocks):
+            x = self.act(self.betas[i] * layer(x)) + x
+        return self.last(x)
+
+
 # ─── Sampling ────────────────────────────────────────────────────────────────
 
 
@@ -203,6 +287,16 @@ def uniform(n: int, bounds: list[tuple[float, float]], device: str = "cpu") -> t
     lo = torch.tensor([b[0] for b in bounds], device=device, dtype=torch.float32)
     hi = torch.tensor([b[1] for b in bounds], device=device, dtype=torch.float32)
     return torch.rand(n, d, device=device) * (hi - lo) + lo
+
+
+def lhs(n: int, bounds: list[tuple[float, float]], device: str = "cpu") -> torch.Tensor:
+    """Latin Hypercube Sampling. bounds: [(lo, hi), ...]. Returns (n, d)."""
+    d = len(bounds)
+    lo = torch.tensor([b[0] for b in bounds], device=device, dtype=torch.float32)
+    hi = torch.tensor([b[1] for b in bounds], device=device, dtype=torch.float32)
+    perms = torch.stack([torch.randperm(n).float() for _ in range(d)], dim=1).to(device)
+    pts = (perms + torch.rand(n, d, device=device)) / n
+    return pts * (hi - lo) + lo
 
 
 def boundary(n: int, bounds: list[tuple[float, float]], device: str = "cpu") -> torch.Tensor:

@@ -12,13 +12,14 @@ Single-file, config via globals, override from CLI:
     python train.py --transfer_from=helmholtz_1d.pt # transfer learning
     python train.py --problem=poisson_1d_variational --use_energy=True  # variational
     python train.py --adaptive_refine_every=200     # adaptive mesh refinement
+    python train.py --architecture=resnet --resnet_tune_beta=True  # ResNet
 """
 
 import sys
 import torch
 
 from nanopinn import (
-    MLP, DDModel, decompose_domain, save_checkpoint, load_checkpoint,
+    MLP, ResNet, DDModel, decompose_domain, save_checkpoint, load_checkpoint,
     train, sobol, freeze_layers, unfreeze_all,
 )
 from problems import PROBLEMS
@@ -29,10 +30,12 @@ from problems import PROBLEMS
 problem = "poisson_1d"
 
 # model
+architecture = "mlp"  # 'mlp' | 'resnet'
 activation = "tanh"  # 'tanh' | 'siren' | 'gelu' | 'swish'
 hidden_dim = 64
 num_hidden = 3
 omega_0 = 30.0  # SIREN frequency (only used if activation='siren')
+resnet_tune_beta = False  # learnable activation scaling for ResNet
 
 # fourier features
 fourier_features = 0  # 0 to disable, e.g. 64 for RFF encoding
@@ -131,6 +134,11 @@ if use_dd:
         fourier_features=fourier_features, fourier_sigma=fourier_sigma, norm=norm,
     ).to(device)
     print(f"DDModel: {len(subdomains)} subdomains, {nsub}")
+elif architecture == "resnet":
+    model = ResNet(
+        layers, activation=activation, tune_beta=resnet_tune_beta,
+        fourier_features=fourier_features, fourier_sigma=fourier_sigma, norm=norm,
+    ).to(device)
 else:
     model = MLP(
         layers, activation=activation, omega_0=omega_0,
