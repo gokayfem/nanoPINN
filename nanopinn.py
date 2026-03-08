@@ -16,6 +16,7 @@ Usage:
     train(model, pde_fn=poisson, bc_fn=my_bc, domain=[(0, 1)])
 """
 
+import itertools
 import math
 import time
 from typing import Callable
@@ -214,6 +215,20 @@ def _make_single_forward(model: nn.Module, params: dict, buffers: dict):
     return fwd
 
 
+def _vmapped_residuals(
+    model: nn.Module, pde_fn: Callable, points: torch.Tensor
+) -> torch.Tensor:
+    """Compute per-point PDE residuals via vmap + functional_call."""
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+
+    def single_residual(x: torch.Tensor) -> torch.Tensor:
+        net = _make_single_forward(model, params, buffers)
+        return pde_fn(net, x)
+
+    return vmap(single_residual)(points)
+
+
 def pde_loss(
     model: nn.Module,
     pde_fn: Callable,
@@ -231,14 +246,7 @@ def pde_loss(
     Returns:
         (scalar_loss, per_point_residuals_squared (N,))
     """
-    params = dict(model.named_parameters())
-    buffers = dict(model.named_buffers())
-
-    def single_residual(x: torch.Tensor) -> torch.Tensor:
-        net = _make_single_forward(model, params, buffers)
-        return pde_fn(net, x)
-
-    residuals = vmap(single_residual)(points)
+    residuals = _vmapped_residuals(model, pde_fn, points)
     sq = residuals ** 2
     if sq.dim() == 1:
         # scalar residual: (N,)
@@ -313,15 +321,7 @@ def causal_pde_loss(
     Returns:
         (weighted_loss, per_point_residuals_squared (N,))
     """
-    # compute residuals with grad (for backward) and detached (for weighting)
-    params = dict(model.named_parameters())
-    buffers = dict(model.named_buffers())
-
-    def single_residual(x: torch.Tensor) -> torch.Tensor:
-        net = _make_single_forward(model, params, buffers)
-        return pde_fn(net, x)
-
-    residuals = vmap(single_residual)(points)
+    residuals = _vmapped_residuals(model, pde_fn, points)
     sq = residuals ** 2
     if sq.dim() == 1:
         res_sq_detached = sq.detach()
@@ -402,7 +402,6 @@ def decompose_domain(
         grids.append([(c, hw) for c in centers])
 
     # cartesian product of all dimensions
-    import itertools
     subdomains = []
     for combo in itertools.product(*grids):
         center = torch.tensor([c for c, _ in combo])
@@ -450,18 +449,19 @@ class DDModel(nn.Module):
                 fourier_sigma=fourier_sigma, norm=norm)
             for _ in subdomains
         ])
-        # store window functions (not nn.Module, just callables)
-        self._windows = [
-            cosine_window(
-                sd["center"],
-                sd["half_width"],
-            )
-            for sd in subdomains
-        ]
+        # register window geometry as buffers so they move with .to(device)
+        centers = torch.stack([sd["center"].float() for sd in subdomains])
+        half_widths = torch.stack([sd["half_width"].float() for sd in subdomains])
+        self.register_buffer("_centers", centers)      # (n_sub, d)
+        self.register_buffer("_half_widths", half_widths)  # (n_sub, d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # compute all window values: list of (N,) tensors
-        w_list = [w(x) for w in self._windows]
+        # compute all window values inline using registered buffers
+        w_list = []
+        for i in range(self._centers.shape[0]):
+            dist = ((x - self._centers[i]) / self._half_widths[i]).abs()
+            per_dim = 0.5 * (1.0 + torch.cos(math.pi * dist.clamp(max=1.0)))
+            w_list.append(per_dim.prod(dim=-1))
         weights = torch.stack(w_list, dim=-1)  # (N, n_sub)
         # normalize to partition of unity
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-10)
@@ -496,12 +496,13 @@ def load_checkpoint(
     path: str,
     model: nn.Module | None = None,
     device: str = "cpu",
+    weights_only: bool = True,
 ) -> dict:
     """Load checkpoint. Optionally load weights into a model.
 
     Returns the full checkpoint dict (config, losses, metadata, model_state).
     """
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=weights_only)
     if model is not None:
         model.load_state_dict(ckpt["model_state"])
     return ckpt
@@ -568,8 +569,8 @@ def train(
     if do_compile and device != "cpu":
         try:
             _loss_fn = torch.compile(_loss_fn, mode="reduce-overhead")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"torch.compile failed, using eager mode: {e}")
 
     def total_loss() -> tuple[torch.Tensor, torch.Tensor]:
         pl, res_sq = _loss_fn(model, pde_fn, pts)
